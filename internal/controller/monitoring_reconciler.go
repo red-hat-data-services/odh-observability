@@ -60,6 +60,8 @@ import (
 const (
 	monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
 	platformType        = "OpenDataHub"
+	platformConfigName  = "odh-" + v1alpha1.MonitoringServiceName + "-config"
+	platformVersionKey  = "platformVersion"
 )
 
 func operatorVersion() string {
@@ -82,6 +84,9 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=monitoring.rhobs,resources=monitoringstacks;thanosqueriers;servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tempo.grafana.com,resources=tempomonolithics;tempostacks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=loki.grafana.com,resources=lokistacks,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=observability.openshift.io,resources=clusterlogforwarders,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=logging.openshift.io;observability.openshift.io,resources=logs,resourceNames=application,verbs=collect
+// +kubebuilder:rbac:groups=serving.kserve.io,resources=inferenceservices;llminferenceservices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors;instrumentations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings;mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
@@ -156,16 +161,28 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	log := logf.FromContext(ctx)
 	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
 
+	platformVersion, err := r.readPlatformVersion(ctx)
+	if err != nil {
+		log.Error(err, "Failed to read platform version from ConfigMap", "name", platformConfigName)
+		return ctrl.Result{}, err
+	}
+	stampPlatform := false
+
 	defer func() {
 		monitoring.Status.ObservedGeneration = monitoring.Generation
 		monitoring.Status.Phase = cm.Phase()
-		monitoring.SetReleaseStatus(platformcommon.ComponentReleaseStatus{
-			Releases: []platformcommon.ComponentRelease{{
-				Name:    v1alpha1.MonitoringServiceName,
-				RepoURL: "https://github.com/opendatahub-io/odh-observability",
-				Version: operatorVersion(),
-			}},
+		// Upsert the module identity without replacing the whole releases
+		// slice, so a failed reconcile cannot wipe a previously stamped
+		// platform version (empty rv is treated as "not gating" by the
+		// platform DAG checker).
+		monitoring.GetReleaseStatus().SetRelease(platformcommon.ComponentRelease{
+			Name:    v1alpha1.MonitoringServiceName,
+			RepoURL: "https://github.com/opendatahub-io/odh-observability",
+			Version: operatorVersion(),
 		})
+		if stampPlatform && platformVersion != "" {
+			monitoring.GetReleaseStatus().SetPlatformRelease(platformVersion)
+		}
 	}()
 
 	// Handle Removed state.
@@ -219,6 +236,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployLokiStack,
 		deployAlerting,
 		deployNodeMetricsEndpoint,
+		deployClusterLogForwarder,
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return ctrl.Result{}, err
@@ -292,9 +310,24 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	cm.AggregateReady()
 
+	// Stamp the platform version only after reconciliation has applied
+	// desired state without returning an error. Early exits (Removed,
+	// preconditions, configuration errors) and error returns leave the
+	// previous handshake value untouched.
+	stampPlatform = true
+
 	if requeueNeeded {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+
+	// Periodic requeue when logs are enabled so that namespace discovery
+	// picks up new InferenceService/LLMInferenceService deployments without
+	// a dedicated watch (the CRDs are optional and a static watch would
+	// crash the controller if KServe is not installed).
+	if monitoring.Spec.Logs != nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -374,13 +407,49 @@ func (r *MonitoringReconciler) patchStatus(ctx context.Context, orig, updated *v
 	return r.Status().Patch(ctx, updated, patch)
 }
 
+// readPlatformVersion reads the platformVersion from the platform config
+// ConfigMap. A missing ConfigMap is standalone mode and returns an empty
+// version. Any other Get error (permissions, connectivity) is returned so
+// reconcile retries instead of treating it as standalone.
+func (r *MonitoringReconciler) readPlatformVersion(ctx context.Context) (string, error) {
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		return "", nil
+	}
+
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Name: platformConfigName, Namespace: ns}, &cm); err != nil {
+		if k8serr.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading platform config ConfigMap %s/%s: %w", ns, platformConfigName, err)
+	}
+
+	return cm.Data[platformVersionKey], nil
+}
+
+func singletonRequests(_ context.Context, _ client.Object) []reconcile.Request {
+	return []reconcile.Request{
+		{NamespacedName: types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}},
+	}
+}
+
+// isPlatformConfigMap matches the platform-written handshake ConfigMap by name
+// and operator namespace. That ConfigMap is labeled part-of=platform (or
+// unlabeled), so it is not covered by the managed-resource predicate. The
+// namespace check keeps same-named ConfigMaps in other namespaces from
+// enqueueing Monitoring.
+func isPlatformConfigMap(obj client.Object) bool {
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		return false
+	}
+	return obj.GetName() == platformConfigName && obj.GetNamespace() == ns
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	toSingleton := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, _ client.Object) []reconcile.Request {
-		return []reconcile.Request{
-			{NamespacedName: types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}},
-		}
-	})
+	toSingleton := handler.EnqueueRequestsFromMapFunc(singletonRequests)
 
 	// Enqueue when any resource stamped by this controller changes (drift detection).
 	// Monitoring is cluster-scoped so it cannot own namespace-scoped resources via
@@ -390,6 +459,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	managedPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetLabels()[odhLabels.PlatformPartOf] == "monitoring"
 	})
+	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Monitoring{}).
@@ -402,6 +472,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
