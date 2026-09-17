@@ -217,8 +217,15 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorRBACConfiguration(t *test
 			jq.Match(`.rules[] | select(.apiGroups[] == "") | .verbs | contains(["get", "watch", "list"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "apps") | .resources | contains(["replicasets"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "apps") | .verbs | contains(["get", "watch", "list"])`),
+			// Loki application tenant write access for the otlphttp/loki exporter
+			jq.Match(`
+				.rules[] | select(.apiGroups[] == "loki.grafana.com") |
+				(.resources | contains(["application"])) and
+				(.resourceNames | contains(["logs"])) and
+				(.verbs | contains(["create"]))
+			`),
 		)),
-		WithCustomErrorMsg("ClusterRole should grant logs collector permissions for k8sattributes processor"),
+		WithCustomErrorMsg("ClusterRole should grant logs collector permissions for k8sattributes processor and Loki writes"),
 	)
 
 	tc.EnsureResourceExists(
@@ -231,18 +238,6 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorRBACConfiguration(t *test
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind logs collector ClusterRole to ServiceAccount"),
-	)
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
-			Name: UsageLogsCollectorName + "-loki-writer",
-		}),
-		WithCondition(And(
-			jq.Match(`.roleRef.name == "lokistack-application-logs-writer"`),
-			jq.Match(`.subjects[0].name == "%s"`, UsageLogsCollectorServiceAccount),
-			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
-		)),
-		WithCustomErrorMsg("ClusterRoleBinding should bind lokistack-application-logs-writer role to logs collector ServiceAccount"),
 	)
 }
 

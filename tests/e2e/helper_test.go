@@ -34,8 +34,8 @@ const (
 	PersesDatasourceName              = "data-science-prometheus-datasource"
 	ClusterPrometheusDatasourceName   = "cluster-prometheus-datasource"
 	ClusterPrometheusDatasourceSecret = "cluster-prometheus-datasource-secret"
-	UsageLogsCollectorName            = "usage-logs"
-	UsageLogsCollectorServiceAccount  = "usage-logs-collector"
+	UsageLogsCollectorName            = "data-science-usage-logs"
+	UsageLogsCollectorServiceAccount  = "data-science-usage-logs-collector"
 	LokiStackName                     = "data-science-lokistack"
 )
 
