@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
@@ -123,6 +124,17 @@ func platformConfigMapGetForbidden() interceptor.Funcs {
 	}
 }
 
+func operatorConditionListForbidden() interceptor.Funcs {
+	return interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if list.GetObjectKind().GroupVersionKind().Kind == "OperatorConditionList" {
+				return k8serr.NewForbidden(schema.GroupResource{Resource: "operatorconditions"}, "", errors.New("not allowed"))
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+}
+
 func TestReadPlatformVersion(t *testing.T) {
 	const ns = "apps-ns"
 
@@ -182,13 +194,15 @@ func TestReconcile_Removed(t *testing.T) {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
 
-	var ready, provisioning string
+	var ready, provisioning, dependenciesReady string
 	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
 		case string(platformcommon.ConditionTypeProvisioningSucceeded):
 			provisioning = string(c.Status)
+		case "MonitoringDependenciesReady":
+			dependenciesReady = string(c.Status)
 		}
 	}
 	if ready != string(metav1.ConditionFalse) {
@@ -197,10 +211,14 @@ func TestReconcile_Removed(t *testing.T) {
 	if provisioning != string(metav1.ConditionFalse) {
 		t.Errorf("ProvisioningSucceeded: want False, got %q", provisioning)
 	}
+	if dependenciesReady != string(metav1.ConditionFalse) {
+		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady)
+	}
 }
 
-// TestReconcile_PreconditionsFailed: no operators installed, nothing configured.
-// Should set MonitoringAvailable=False, Ready=False, no error returned.
+// TestReconcile_PreconditionsFailed: required operators are not installed.
+// Should report the missing dependencies with installation guidance, set
+// Ready=False, and return no reconciliation error.
 func TestReconcile_PreconditionsFailed(t *testing.T) {
 	s := newTestScheme(t)
 
@@ -223,20 +241,94 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
 
-	var ready, monAvail string
+	var ready string
+	var dependenciesReady *platformcommon.Condition
 	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
-		case "MonitoringAvailable":
-			monAvail = string(c.Status)
+		case "MonitoringDependenciesReady":
+			condition := c
+			dependenciesReady = &condition
 		}
 	}
 	if ready != string(metav1.ConditionFalse) {
 		t.Errorf("Ready: want False, got %q", ready)
 	}
-	if monAvail != string(metav1.ConditionFalse) {
-		t.Errorf("MonitoringAvailable: want False, got %q", monAvail)
+	if dependenciesReady == nil {
+		t.Fatal("MonitoringDependenciesReady condition was not reported")
+	}
+	if dependenciesReady.Status != metav1.ConditionFalse {
+		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady.Status)
+	}
+	if dependenciesReady.Reason != "MissingOperator" {
+		t.Errorf("MonitoringDependenciesReady reason: want MissingOperator, got %q", dependenciesReady.Reason)
+	}
+	for _, expected := range []string{"Red Hat build of OpenTelemetry", "Cluster Observability Operator", "OperatorHub"} {
+		if !strings.Contains(dependenciesReady.Message, expected) {
+			t.Errorf("MonitoringDependenciesReady message %q does not contain %q", dependenciesReady.Message, expected)
+		}
+	}
+}
+
+func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(operatorConditionListForbidden()).Build()
+	r := newTestReconciler(t, s, cli)
+
+	_, err := r.reconcile(context.Background(), m)
+	if err == nil {
+		t.Fatal("expected lookup error to be returned for controller-runtime retry")
+	}
+	if !k8serr.IsForbidden(err) {
+		t.Fatalf("expected forbidden lookup error, got: %v", err)
+	}
+	for _, condition := range m.Status.Conditions {
+		if condition.Reason == "MissingOperator" {
+			t.Errorf("lookup failure was incorrectly reported as a missing operator: %#v", condition)
+		}
+	}
+}
+
+func TestReconcile_LoggingPreconditionsFailed(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{}}
+
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+
+	_, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	var dependenciesReady *platformcommon.Condition
+	for _, c := range m.Status.Conditions {
+		if c.Type == "MonitoringDependenciesReady" {
+			condition := c
+			dependenciesReady = &condition
+			break
+		}
+	}
+	if dependenciesReady == nil {
+		t.Fatal("MonitoringDependenciesReady condition was not reported")
+	}
+	if dependenciesReady.Status != metav1.ConditionFalse || dependenciesReady.Reason != "MissingOperator" {
+		t.Errorf("MonitoringDependenciesReady: want False/MissingOperator, got %s/%s",
+			dependenciesReady.Status, dependenciesReady.Reason)
+	}
+	for _, expected := range []string{"Loki Operator", "Red Hat OpenShift Logging Operator", "OperatorHub"} {
+		if !strings.Contains(dependenciesReady.Message, expected) {
+			t.Errorf("MonitoringDependenciesReady message %q does not contain %q", dependenciesReady.Message, expected)
+		}
 	}
 }
 
@@ -262,13 +354,17 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
 
-	var ready, degraded string
+	var ready, degraded, dependenciesReady, legacyAvailable string
 	for _, c := range m.Status.Conditions {
 		switch c.Type {
 		case string(platformcommon.ConditionTypeReady):
 			ready = string(c.Status)
 		case string(platformcommon.ConditionTypeDegraded):
 			degraded = string(c.Status)
+		case "MonitoringDependenciesReady":
+			dependenciesReady = string(c.Status)
+		case "MonitoringAvailable":
+			legacyAvailable = string(c.Status)
 		}
 	}
 	if ready != string(metav1.ConditionTrue) {
@@ -276,6 +372,12 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	}
 	if degraded != string(metav1.ConditionFalse) {
 		t.Errorf("Degraded: want False, got %q", degraded)
+	}
+	if dependenciesReady != string(metav1.ConditionTrue) {
+		t.Errorf("MonitoringDependenciesReady: want True, got %q", dependenciesReady)
+	}
+	if legacyAvailable != dependenciesReady {
+		t.Errorf("legacy MonitoringAvailable status %q does not match MonitoringDependenciesReady %q", legacyAvailable, dependenciesReady)
 	}
 }
 
