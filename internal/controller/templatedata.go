@@ -130,10 +130,13 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":              monitoringNamespace,
-		"GatewayNamespace":       getEnvOrDefault("GATEWAY_NAMESPACE", monitoringNamespace),
-		"Traces":                 monitoring.Spec.Traces != nil,
-		"Metrics":                monitoring.Spec.Metrics != nil,
+		"Namespace":        monitoringNamespace,
+		"GatewayNamespace": getEnvOrDefault("GATEWAY_NAMESPACE", monitoringNamespace),
+		"Traces":           monitoring.Spec.Traces != nil,
+		"Metrics":          monitoring.Spec.Metrics != nil,
+		"MetricsStorage":   monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
+		"TempoStorage":           false,
 		"Logs":                   monitoring.Spec.Logs != nil,
 		"AcceleratorMetrics":     monitoring.Spec.Metrics != nil,
 		"OperatorNamespace":      operatorNamespace,
@@ -141,6 +144,8 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"OperatorPodPrefix":      getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
 		"MetricsExporters":       make(map[string]string),
 		"MetricsExporterNames":   []string{},
+		"TracesExporters":        make(map[string]string),
+		"TracesExporterNames":    []string{},
 		"PersesImage":            getPersesImage(),
 		"PersesAPIVersion":       persesAPIVersion,
 		"Korrel8rImage":          getKorrel8rImage(),
@@ -333,7 +338,8 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		}
 	}
 
-	if monitoring.Spec.Metrics != nil {
+	// COO owns MonitoringStack/Thanos/Perses; only required for built-in metrics storage.
+	if monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil {
 		if info, err := operatorExists(ctx, c, clusterObservabilityOperator); err != nil {
 			return err
 		} else if info == nil {
@@ -341,7 +347,8 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		}
 	}
 
-	if monitoring.Spec.Traces != nil {
+	// Tempo is only required for built-in storage; exporters-only traces use the collector.
+	if monitoring.Spec.Traces != nil && monitoring.Spec.Traces.Storage != nil {
 		if info, err := operatorExists(ctx, c, tempoOperator); err != nil {
 			return err
 		} else if info == nil {
@@ -486,6 +493,36 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 	templateData["OtlpEndpoint"] = fmt.Sprintf("http://data-science-collector.%s.svc.cluster.local:4317", namespace)
 	templateData["SampleRatio"] = getStringValueOrDefault(traces.SampleRatio, defaultTracesSampleRatio)
 
+	validatedExporters := make(map[string]string)
+	exporterNames := make([]string, 0)
+	if traces.Exporters != nil {
+		var err error
+		validatedExporters, err = validateExporters(traces.Exporters)
+		if err != nil {
+			return err
+		}
+		for n := range validatedExporters {
+			exporterNames = append(exporterNames, n)
+		}
+		sort.Strings(exporterNames)
+	}
+	templateData["TracesExporters"] = validatedExporters
+	templateData["TracesExporterNames"] = exporterNames
+
+	// Exporters-only (no storage): no built-in Tempo; collector uses custom exporters only.
+	if traces.Storage == nil {
+		templateData["TempoStorage"] = false
+		templateData["Backend"] = ""
+		templateData["TracesRetention"] = ""
+		templateData["TempoTLSEnabled"] = false
+		templateData["TempoCertificateSecret"] = ""
+		templateData["TempoCAConfigMap"] = ""
+		templateData["TempoEndpoint"] = ""
+		templateData["TempoQueryEndpoint"] = ""
+		return nil
+	}
+
+	templateData["TempoStorage"] = true
 	backend := getStringValueOrDefault(traces.Storage.Backend, defaultTracesBackend)
 	templateData["Backend"] = backend
 
@@ -516,22 +553,6 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}
-
-	validatedExporters := make(map[string]string)
-	exporterNames := make([]string, 0)
-	if traces.Exporters != nil {
-		var err error
-		validatedExporters, err = validateExporters(traces.Exporters)
-		if err != nil {
-			return err
-		}
-		for n := range validatedExporters {
-			exporterNames = append(exporterNames, n)
-		}
-		sort.Strings(exporterNames)
-	}
-	templateData["TracesExporters"] = validatedExporters
-	templateData["TracesExporterNames"] = exporterNames
 
 	return nil
 }

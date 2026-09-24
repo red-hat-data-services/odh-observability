@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -75,7 +76,9 @@ func TestCheckPreconditions_MetricsRequiresOTelAndCOO(t *testing.T) {
 	registerOperatorCondition(s)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
 	err := checkMonitoringPreconditions(context.Background(), cli, m)
@@ -92,13 +95,32 @@ func TestCheckPreconditions_MetricsRequiresOTelAndCOO(t *testing.T) {
 	}
 }
 
+func TestCheckPreconditions_ExportersOnlyMetricsDoesNotRequireCOO(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Exporters: map[string]kruntime.RawExtension{
+			"otlphttp/external": {Raw: []byte(`{"endpoint":"http://example:4318"}`)},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+	).Build()
+	if err := checkMonitoringPreconditions(context.Background(), cli, m); err != nil {
+		t.Fatalf("exporters-only metrics should not require COO, got: %v", err)
+	}
+}
+
 func TestCheckPreconditions_TracesRequiresOTelAndTempo(t *testing.T) {
 	s := newTestScheme(t)
 	registerOperatorCondition(s)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
@@ -116,14 +138,35 @@ func TestCheckPreconditions_TracesRequiresOTelAndTempo(t *testing.T) {
 	}
 }
 
+func TestCheckPreconditions_ExportersOnlyTracesDoesNotRequireTempo(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Traces = &v1alpha1.Traces{
+		Exporters: map[string]kruntime.RawExtension{
+			"debug": {Raw: []byte(`{"verbosity":"detailed"}`)},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+	).Build()
+	if err := checkMonitoringPreconditions(context.Background(), cli, m); err != nil {
+		t.Fatalf("exporters-only traces should not require Tempo Operator, got: %v", err)
+	}
+}
+
 func TestCheckPreconditions_AllOperatorsPresent(t *testing.T) {
 	s := newTestScheme(t)
 	registerOperatorCondition(s)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	otel := newOperatorCondition("opentelemetry-operator.v0.100.0")
@@ -208,9 +251,11 @@ func TestCheckPreconditions_AllFeaturesAndOperatorsPresent(t *testing.T) {
 	registerOperatorCondition(s)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{}}
 	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{}}
@@ -233,9 +278,11 @@ func TestCheckPreconditions_AllFeaturesReportEachMissingOperatorOnce(t *testing.
 	registerOperatorCondition(s)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{}}
 	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{}}
@@ -269,15 +316,19 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 		unexpectedMissing string
 	}{
 		{
-			name:              "metrics with OpenTelemetry installed",
-			configure:         func(m *v1alpha1.Monitoring) { m.Spec.Metrics = &v1alpha1.Metrics{} },
+			name: "metrics with OpenTelemetry installed",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+			},
 			installedOperator: "opentelemetry-operator.v0.158.0-1",
 			expectedMissing:   "Cluster Observability Operator",
 			unexpectedMissing: "Red Hat build of OpenTelemetry",
 		},
 		{
-			name:              "metrics with COO installed",
-			configure:         func(m *v1alpha1.Monitoring) { m.Spec.Metrics = &v1alpha1.Metrics{} },
+			name: "metrics with COO installed",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+			},
 			installedOperator: "cluster-observability-operator.v1.5.2",
 			expectedMissing:   "Red Hat build of OpenTelemetry",
 			unexpectedMissing: "Cluster Observability Operator",
@@ -285,7 +336,7 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 		{
 			name: "traces with OpenTelemetry installed",
 			configure: func(m *v1alpha1.Monitoring) {
-				m.Spec.Traces = &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
+				m.Spec.Traces = &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
 			},
 			installedOperator: "opentelemetry-operator.v0.158.0-1",
 			expectedMissing:   "Tempo Operator",
@@ -294,7 +345,7 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 		{
 			name: "traces with Tempo installed",
 			configure: func(m *v1alpha1.Monitoring) {
-				m.Spec.Traces = &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
+				m.Spec.Traces = &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
 			},
 			installedOperator: "tempo-operator.v0.22.0-2",
 			expectedMissing:   "Red Hat build of OpenTelemetry",
@@ -531,7 +582,7 @@ func TestAddReplicasData_NoStorage(t *testing.T) {
 
 func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendPV,
 			Size:    "10Gi",
 		},
@@ -543,6 +594,9 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	if data["TempoStorage"] != true {
+		t.Errorf("TempoStorage: want true, got %v", data["TempoStorage"])
+	}
 	if data["Backend"] != v1alpha1.StorageBackendPV {
 		t.Errorf("Backend: want %q, got %v", v1alpha1.StorageBackendPV, data["Backend"])
 	}
@@ -559,9 +613,32 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	}
 }
 
+func TestAddTracesTemplateData_ExportersOnlyWithoutStorage(t *testing.T) {
+	traces := &v1alpha1.Traces{
+		Exporters: map[string]kruntime.RawExtension{
+			"debug": {Raw: []byte(`{"verbosity":"detailed"}`)},
+		},
+	}
+	data := make(map[string]any)
+	err := addTracesTemplateData(data, traces, "test-ns")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["TempoStorage"] != false {
+		t.Errorf("TempoStorage: want false, got %v", data["TempoStorage"])
+	}
+	if data["TempoEndpoint"] != "" {
+		t.Errorf("TempoEndpoint: want empty for exporters-only, got %v", data["TempoEndpoint"])
+	}
+	names, ok := data["TracesExporterNames"].([]string)
+	if !ok || len(names) != 1 || names[0] != "debug" {
+		t.Errorf("TracesExporterNames: want [debug], got %v", data["TracesExporterNames"])
+	}
+}
+
 func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendS3,
 			Secret:  "my-s3-secret",
 		},
@@ -583,7 +660,7 @@ func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 
 func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendGCS,
 			Secret:  "my-gcs-secret",
 		},
@@ -605,7 +682,7 @@ func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 
 func TestAddTracesTemplateData_DefaultSampleRatio(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -620,7 +697,7 @@ func TestAddTracesTemplateData_DefaultSampleRatio(t *testing.T) {
 
 func TestAddTracesTemplateData_DefaultRetention(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -635,7 +712,7 @@ func TestAddTracesTemplateData_DefaultRetention(t *testing.T) {
 
 func TestAddTracesTemplateData_CustomRetention(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend:   v1alpha1.StorageBackendPV,
 			Retention: metav1.Duration{Duration: 48 * time.Hour},
 		},
@@ -653,7 +730,7 @@ func TestAddTracesTemplateData_CustomRetention(t *testing.T) {
 
 func TestAddTracesTemplateData_TLSEnabled(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 		TLS: &v1alpha1.TracesTLS{
 			Enabled:           true,
 			CertificateSecret: "tempo-cert",
@@ -679,7 +756,7 @@ func TestAddTracesTemplateData_TLSEnabled(t *testing.T) {
 
 func TestAddTracesTemplateData_TLSDisabled(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -697,7 +774,7 @@ func TestAddTracesTemplateData_TLSDisabled(t *testing.T) {
 
 func TestAddTracesTemplateData_WithExporters(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 		Exporters: map[string]kruntime.RawExtension{
 			"otlp/custom": {Raw: []byte(`endpoint: https://collector.example.com:4317`)},
 		},
@@ -873,9 +950,11 @@ func TestBuildTemplateData_UsesEffectiveMonitoringNamespace(t *testing.T) {
 func TestBuildTemplateData_Korrel8rConfiguration(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.Logs = &v1alpha1.Logs{}
 
@@ -910,7 +989,9 @@ func TestBuildTemplateData_Korrel8rAPIServerEndpointDiscoveryFailureBlocksRender
 
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).
 		WithInterceptorFuncs(kubernetesAPIServerEndpointSliceListForbidden()).Build()
@@ -950,15 +1031,30 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 	if data["Metrics"] != true {
 		t.Error("Metrics: want true")
 	}
+	if data["MetricsStorage"] != true {
+		t.Error("MetricsStorage: want true")
+	}
+	if data["TempoStorage"] != false {
+		t.Errorf("TempoStorage: want false for metrics-only, got %v", data["TempoStorage"])
+	}
 	if data["StorageSize"] != "10Gi" {
 		t.Errorf("StorageSize: want '10Gi', got %v", data["StorageSize"])
+	}
+
+	// Operator render uses missingkey=error; metrics-only must still render Korrel8r.
+	if _, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
+		FS: resourcesFS, Path: Korrel8rConfigTemplate,
+	}}, data); err != nil {
+		t.Fatalf("Korrel8r config must render for metrics-only Monitoring: %v", err)
 	}
 }
 
 func TestBuildTemplateData_CollectorReplicasExplicit(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.CollectorReplicas = 5
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
