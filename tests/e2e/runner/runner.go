@@ -34,8 +34,11 @@ const (
 	envTestTimeout      = "E2E_TEST_TIMEOUT"
 
 	envTestMonitoringNamespace      = "E2E_TEST_MONITORING_NAMESPACE"
+	envTestApplicationsNamespace    = "E2E_TEST_APPLICATIONS_NAMESPACE"
 	envTestMonitoringCRName         = "E2E_TEST_MONITORING_CR_NAME"
 	envTestInstallOperators         = "E2E_TEST_INSTALL_OPERATORS"
+	envTestApplyMonitoringManifest  = "E2E_TEST_APPLY_MONITORING_MANIFEST"
+	envTestCleanupState             = "E2E_TEST_CLEANUP_STATE"
 	envTestAPIMode                  = "E2E_TEST_API_MODE"
 	envTestDSCICRName               = "E2E_TEST_DSCI_CR_NAME"
 	envTestEventuallyTimeout        = "E2E_TEST_EVENTUALLY_TIMEOUT"
@@ -245,8 +248,11 @@ func (r *Runner) execPackages(args []string) int {
 func (r *Runner) envToFlags() []string {
 	envMap := map[string]string{
 		envTestMonitoringNamespace:      "-monitoring-namespace",
+		envTestApplicationsNamespace:    "-applications-namespace",
 		envTestMonitoringCRName:         "-monitoring-cr-name",
 		envTestInstallOperators:         "-install-operators",
+		envTestApplyMonitoringManifest:  "-apply-monitoring-manifest",
+		envTestCleanupState:             "-cleanup-test-state",
 		envTestAPIMode:                  "-api-mode",
 		envTestDSCICRName:               "-dsci-cr-name",
 		envTestEventuallyTimeout:        "-eventually-timeout",
