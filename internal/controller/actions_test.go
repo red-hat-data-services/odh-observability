@@ -879,6 +879,7 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -922,6 +923,7 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -980,6 +982,7 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1336,6 +1339,7 @@ func TestDeployUsageLogsCollector_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1375,6 +1379,7 @@ func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1675,6 +1680,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 			if condition == nil {
 				t.Fatal("expected Korrel8rAvailable condition")
+				return
 			}
 			if condition.Status != tt.wantStatus {
 				t.Errorf("status: want %s, got %s", tt.wantStatus, condition.Status)
@@ -1729,6 +1735,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 	if condition == nil {
 		t.Fatal("expected Korrel8rAvailable condition")
+		return
 	}
 	if condition.Status != metav1.ConditionTrue {
 		t.Fatalf("status: want True, got %s", condition.Status)
@@ -1851,6 +1858,7 @@ func assertKorrel8rTLSEndpoint(t *testing.T, deployment, service, networkPolicy 
 	t.Helper()
 	if deployment == nil || service == nil || networkPolicy == nil {
 		t.Fatal("rendered Korrel8r resources are incomplete")
+		return
 	}
 	containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
 	if err != nil || !found || len(containers) != 1 {
