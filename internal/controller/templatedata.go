@@ -194,7 +194,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	// LokiStack configuration
-	lokiStackName := "data-science-lokistack"
+	lokiStackName := lokiStackResourceName
 	templateData["LokiStackName"] = lokiStackName
 	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
 	// application tenant is the pinned tenant for inference logs.
@@ -238,9 +238,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	// Cluster log forwarding configuration
-	clusterLogForwarderName := "data-science-cluster-log-forwarder"
+	clusterLogForwarderName := clusterLogForwarderResourceName
 	templateData["ClusterLogForwarderName"] = clusterLogForwarderName
 	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
+	templateData["ClusterLogForwarderNetworkPolicyName"] = ClusterLogForwarderNetworkPolicyName
 	templateData["ClusterLoggingNamespace"] = clusterLoggingNamespace
 
 	if logs := monitoring.Spec.Logs; logs != nil {
@@ -314,6 +315,7 @@ func addKorrel8rConfigChecksum(templateData map[string]any) error {
 
 func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
 	templateData["Korrel8rAPIServerCIDRs"] = []string{}
+	templateData["KubernetesAPIServerCIDRs"] = []string{}
 	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil && monitoring.Spec.Logs == nil {
 		return nil
 	}
@@ -331,6 +333,7 @@ func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *
 		return fmt.Errorf("resolving Kubernetes API endpoint CIDRs for Korrel8r: %w", err)
 	}
 	templateData["Korrel8rAPIServerCIDRs"] = apiServerCIDRs
+	templateData["KubernetesAPIServerCIDRs"] = apiServerCIDRs
 	return nil
 }
 
