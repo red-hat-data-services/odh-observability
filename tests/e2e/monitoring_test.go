@@ -254,6 +254,11 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 		),
 		WithCustomErrorMsg("prometheus-web-tls-ca ConfigMap should exist with CA injection annotation"),
 	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: "prometheus-web-tls-ca", Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.data."service-ca.crt" != null`)),
+		WithCustomErrorMsg("prometheus-web-tls-ca Secret should contain the injected service CA"),
+	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: "prometheus-operated", Namespace: tc.MonitoringNamespace}),
@@ -1876,7 +1881,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
 
-	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorName, tc.MonitoringNamespace)
+	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
@@ -2514,6 +2519,8 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
 		t.Run("Operand NetworkPolicies and lifecycle", tc.ValidateOperandNetworkPolicies)
+		t.Run("Collector and TargetAllocator NetworkPolicy contract", tc.ValidateCollectorNetworkPolicyContract)
+		t.Run("Collector OTLP namespace authorization", tc.ValidateCollectorOTLPNamespaceBoundary)
 	})
 }
 

@@ -95,6 +95,58 @@ func newMonitoring(name string) *v1alpha1.Monitoring {
 	}
 }
 
+func TestPreparePrometheusWebTLSCA(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	ca := &unstructured.Unstructured{}
+	ca.SetGroupVersionKind(controllergvk.ConfigMap)
+	ca.SetName(prometheusWebTLSCAConfigMapName)
+	ca.SetNamespace(m.Spec.Namespace)
+	stack := &unstructured.Unstructured{}
+	stack.SetGroupVersionKind(controllergvk.MonitoringStack)
+	stack.SetName("data-science-monitoringstack")
+	stack.SetNamespace(m.Spec.Namespace)
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
+	collector.SetName("data-science-collector")
+	collector.SetNamespace(m.Spec.Namespace)
+	desired := []unstructured.Unstructured{*ca, *stack, *collector}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	r := newTestReconciler(t, s, cli)
+	ready, err := r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || ready {
+		t.Fatalf("expected CA to be pending before injection, got ready=%v error=%v", ready, err)
+	}
+
+	var created corev1.ConfigMap
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &created); err != nil {
+		t.Fatalf("CA ConfigMap was not applied before other resources: %v", err)
+	}
+	if got := withoutMonitoringStack(desired); len(got) != 2 || got[0].GetKind() != "ConfigMap" || got[1].GetKind() != "OpenTelemetryCollector" {
+		t.Fatalf("pending CA must omit only MonitoringStack, got %v", got)
+	}
+
+	created.Data = map[string]string{serviceCACertificateKey: "test-ca"}
+	if err := cli.Update(context.Background(), &created); err != nil {
+		t.Fatalf("injecting CA into ConfigMap: %v", err)
+	}
+	ready, err = r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || !ready {
+		t.Fatalf("expected CA Secret ready after injection, got ready=%v error=%v", ready, err)
+	}
+	var secret corev1.Secret
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &secret); err != nil {
+		t.Fatalf("CA Secret was not synchronized: %v", err)
+	}
+	if string(secret.Data[serviceCACertificateKey]) != "test-ca" {
+		t.Fatalf("CA Secret was not synchronized: data=%v", secret.Data)
+	}
+}
+
 func registerOperatorConditionTypes(s *runtime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition",
@@ -333,6 +385,20 @@ func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 	if !k8serr.IsForbidden(err) {
 		t.Fatalf("expected forbidden lookup error, got: %v", err)
 	}
+	if m.Status.Phase != platformcommon.PhaseNotReady {
+		t.Fatalf("failed reconcile should set NotReady phase, got %s", m.Status.Phase)
+	}
+	for _, conditionType := range []string{string(platformcommon.ConditionTypeReady), string(platformcommon.ConditionTypeProvisioningSucceeded)} {
+		found := false
+		for _, condition := range m.Status.Conditions {
+			if condition.Type == conditionType {
+				found = condition.Status == metav1.ConditionFalse
+			}
+		}
+		if !found {
+			t.Errorf("%s must be False after reconciliation error", conditionType)
+		}
+	}
 	for _, condition := range m.Status.Conditions {
 		if condition.Reason == "MissingOperator" {
 			t.Errorf("lookup failure was incorrectly reported as a missing operator: %#v", condition)
@@ -423,6 +489,37 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	}
 	if legacyAvailable != dependenciesReady {
 		t.Errorf("legacy MonitoringAvailable status %q does not match MonitoringDependenciesReady %q", legacyAvailable, dependenciesReady)
+	}
+}
+
+func TestReconcile_CleansOperatorNetworkPoliciesInEffectiveNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", defaultMonitoringNamespace)
+
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+
+	stalePolicy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      collectorOperatorNetworkPolicyName,
+			Namespace: defaultMonitoringNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  openTelemetryCollectorComponent,
+				"app.kubernetes.io/instance":   defaultMonitoringNamespace + ".data-science-collector",
+				"app.kubernetes.io/managed-by": opentelemetryOperator,
+				"app.kubernetes.io/part-of":    openTelemetryPartOf,
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, stalePolicy).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(stalePolicy), &networkingv1.NetworkPolicy{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("expected generated policy in effective namespace to be deleted, got %v", err)
 	}
 }
 
@@ -826,6 +923,97 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 	withoutUID.UID = ""
 	if shouldCollectTargetAllocatorRBAC(withoutUID, staleTargetRole, nil) {
 		t.Error("GC must fail closed when the Monitoring UID is unavailable")
+	}
+}
+
+func TestIsOpenTelemetryOperatorNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+		"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+		"app.kubernetes.io/part-of":    "opentelemetry",
+	}}}
+	if !isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("expected the generated TargetAllocator policy to be identified")
+	}
+
+	policy.Labels["app.kubernetes.io/managed-by"] = "odh-observability"
+	if isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("module-owned policy must not be identified as an Operator-generated policy")
+	}
+}
+
+func TestCleanupOpenTelemetryOperatorNetworkPolicies(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	stale := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-collector-targetallocator-networkpolicy",
+			Namespace: "opendatahub",
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+				"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+				"app.kubernetes.io/managed-by": "opentelemetry-operator",
+				"app.kubernetes.io/part-of":    "opentelemetry",
+			},
+		},
+	}
+	reconciler := &MonitoringReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(stale).Build()}
+	if err := reconciler.cleanupOpenTelemetryOperatorNetworkPolicies(context.Background(), stale.Namespace); err != nil {
+		t.Fatalf("cleanup returned an error: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stale), &networkingv1.NetworkPolicy{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("expected generated policy to be deleted, got %v", err)
+	}
+}
+
+func TestOpenTelemetryOperatorNetworkPolicyWatch(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "monitoring-test")
+	pred := predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent)
+	for _, test := range []struct {
+		name      string
+		policy    string
+		component string
+		mutate    func(*networkingv1.NetworkPolicy)
+		want      bool
+	}{
+		{name: "collector recreated", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector", want: true},
+		{name: "allocator recreated", policy: "data-science-collector-targetallocator-networkpolicy", component: "opentelemetry-targetallocator", want: true},
+		{name: "other policy name", policy: "user-policy", component: "opentelemetry-collector"},
+		{name: "wrong component", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-targetallocator"},
+		{name: "other namespace", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Namespace = "other" }},
+		{name: "other collector", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels["app.kubernetes.io/instance"] = "monitoring-test.other" }},
+		{name: "unlabeled policy", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+				Name: test.policy, Namespace: "monitoring-test",
+				Labels: map[string]string{
+					"app.kubernetes.io/component":  test.component,
+					"app.kubernetes.io/instance":   "monitoring-test.data-science-collector",
+					"app.kubernetes.io/managed-by": "opentelemetry-operator",
+					"app.kubernetes.io/part-of":    "opentelemetry",
+				},
+			}}
+			if test.mutate != nil {
+				test.mutate(policy)
+			}
+			if got := pred.Create(event.CreateEvent{Object: policy}); got != test.want {
+				t.Fatalf("create event: got %t, want %t", got, test.want)
+			}
+			if got := pred.Update(event.UpdateEvent{ObjectOld: policy.DeepCopy(), ObjectNew: policy}); got != test.want {
+				t.Fatalf("update event: got %t, want %t", got, test.want)
+			}
+		})
+	}
+	if pred.Create(event.CreateEvent{Object: &corev1.ConfigMap{}}) {
+		t.Fatal("a non-NetworkPolicy event must not trigger legacy policy cleanup")
 	}
 }
 
