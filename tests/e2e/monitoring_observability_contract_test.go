@@ -28,7 +28,10 @@ const (
 	clusterLogForwarderName        = "data-science-cluster-log-forwarder"
 	clusterLogForwarderPolicyName  = clusterLogForwarderName + "-allow"
 	clusterLogForwarderServiceAcct = clusterLogForwarderName + "-collector"
-	usageLogsSharedSecretName      = "test-loki-shared-secret"
+	// The two LokiStacks have independent storage, so each gets its own secret
+	// and its own bucket. Nothing is shared between them.
+	usageLogsLokiSecretName = "test-usage-logs-loki-secret"
+	logsLokiSecretName      = "test-logs-loki-secret"
 )
 
 // ValidateMonitoringOperandNamespaceContract verifies the namespace handoff used by
@@ -181,7 +184,10 @@ func (tc *MonitoringTestCtx) ValidateTempoGatewayTenantConfiguration(t *testing.
 	)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
-		WithCondition(jq.Match(`.spec.exporter.endpoint == "http://%s.%s.svc.cluster.local:4317"`, OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)),
+		WithCondition(And(
+			jq.Match(`.spec.exporter.endpoint == "https://%s-headless.%s.svc.cluster.local:4317"`, OpenTelemetryCollectorServiceName, tc.MonitoringNamespace),
+			jq.Match(`.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"`),
+		)),
 	)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace}),
@@ -255,13 +261,15 @@ func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		// Preserve the shared usageLogs setup for the remaining usage-log tests.
+		// Preserve the usageLogs setup for the remaining usage-log tests.
 		tc.updateMonitoringConfig(withManagementState(common.Managed), jq.Transform(`del(.spec.logs)`))
 	})
-	tc.updateMonitoringConfigWithoutReady(
-		withManagementState(common.Managed),
-		withLogsStorage("s3", usageLogsSharedSecretName, tc.DefaultStorageClass),
-	)
+
+	// The ClusterLogForwarder targets the log forwarding LokiStack, a different
+	// CR from the usage logs one, and the operator withholds the contract until
+	// that stack is ready. setupLogsLokiStack is a no-op beyond the wait when
+	// the stack is already up from an earlier test in the group.
+	tc.setupLogsLokiStack(t)
 
 	status, reason, message, found := tc.waitForMonitoringCondition(t, conditions.ConditionClusterLogForwarderAvailable)
 	if !found {
