@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -220,12 +221,12 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
+	if len(containers) != 3 {
 		t.Fatalf("Thanos proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
 	}
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -240,7 +241,10 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
-
+	assertContainerArgs(t, findContainer(t, containers, "method-gate"),
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	)
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
 	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
@@ -500,6 +504,184 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
+// TestLokiStackTemplatesRenderIndependentStorage renders both LokiStack
+// templates from one data map and checks each CR picks up only its own storage.
+//
+// The two templates are identical apart from the key prefix they read
+// (.LokiStorage* versus .UsageLogsLokiStorage*), so a single mis-prefixed key
+// would point one stack at the other's bucket without failing to render. Every
+// value below differs between the two families so that such a swap shows up by
+// name.
+func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace": testMonitoringNamespace,
+
+		"LokiStackName":             lokiStackResourceName,
+		"LokiStorageSecretName":     "logs-secret",
+		"LokiStorageType":           "s3",
+		"LokiStorageCredentialMode": "static",
+		"LokiStorageClassName":      "logs-sc",
+		"LogsLokiStackSize":         "1x.small",
+
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
+	}
+
+	tests := []struct {
+		template        string
+		stackName       string
+		secretName      string
+		credentialMode  string
+		storageClass    string
+		storageTypeName string
+		size            string
+	}{
+		{
+			template:        LokiStackTemplate,
+			stackName:       lokiStackResourceName,
+			secretName:      "logs-secret",
+			credentialMode:  "static",
+			storageClass:    "logs-sc",
+			storageTypeName: "s3",
+			size:            "1x.small",
+		},
+		{
+			template:        UsageLogsLokiStackTemplate,
+			stackName:       usageLogsLokiStackResourceName,
+			secretName:      "usage-logs-secret",
+			credentialMode:  "token",
+			storageClass:    "usage-logs-sc",
+			storageTypeName: "s3",
+			size:            "1x.demo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stackName, func(t *testing.T) {
+			t.Parallel()
+
+			resources := renderObservabilityTemplate(t, tt.template, data)
+			stack := findRenderedResource(t, resources, "LokiStack", tt.stackName)
+
+			for _, field := range []struct {
+				path []string
+				want string
+			}{
+				{[]string{"spec", "storage", "secret", "name"}, tt.secretName},
+				{[]string{"spec", "storage", "secret", "type"}, tt.storageTypeName},
+				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
+				{[]string{"spec", "storageClassName"}, tt.storageClass},
+				{[]string{"spec", "size"}, tt.size},
+				// Both stacks serve the same tenant, which is why they cannot
+				// share a bucket; checkStorageIsolation depends on it.
+				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
+			} {
+				got, found, err := unstructured.NestedString(stack.Object, field.path...)
+				if err != nil || !found || got != field.want {
+					t.Errorf("%s %s: want %q, got %q (found=%t error=%v)",
+						tt.stackName, strings.Join(field.path, "."), field.want, got, found, err)
+				}
+			}
+
+			if namespace := stack.GetNamespace(); namespace != testMonitoringNamespace {
+				t.Errorf("%s: want namespace %q, got %q", tt.stackName, testMonitoringNamespace, namespace)
+			}
+		})
+	}
+}
+
+// TestLokiStackTemplatesCarryComponentLabel is the drift guard for the garbage
+// collection shield. A rejected storage configuration renders none of these
+// templates, so the only thing keeping the live resources out of the
+// collector's reach is this label on the objects already in the cluster. A
+// template added to a stack action without it would be deleted the first time
+// the storage check fails, which is exactly the data loss the shield prevents.
+//
+// Which value it carries is as much the contract as that it carries one. The
+// two stacks are shielded independently, so a usage logs template labelled for
+// log forwarding would be spared by the wrong claimant's failure and collected
+// on its own.
+func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace":                          testMonitoringNamespace,
+		"LokiStackName":                      lokiStackResourceName,
+		"LokiStorageSecretName":              "logs-secret",
+		"LokiStorageType":                    "s3",
+		"LokiStorageCredentialMode":          "static",
+		"LokiStorageClassName":               "logs-sc",
+		"LogsLokiStackSize":                  "1x.extra-small",
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
+		"Korrel8rName":                       Korrel8rServiceName,
+		// The usage logs gateway policy names the collector as its only peer.
+		"UsageLogsCollectorName":               "data-science-usage-logs",
+		"UsageLogs":                            true,
+		"UsageLogsEndpoint":                    "https://usage-logs.example.com/otlp",
+		"UsageLogsCredentialSecret":            "",
+		"UsageLogsExporterNames":               []string{},
+		"UsageLogsAttributeNames":              []string{},
+		"CollectorReplicas":                    1,
+		"CollectorCPURequest":                  "100m",
+		"CollectorCPULimit":                    "500m",
+		"CollectorMemoryRequest":               "128Mi",
+		"CollectorMemoryLimit":                 "256Mi",
+		"ClusterLogForwarderName":              "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderServiceAccount":    "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderNetworkPolicyName": ClusterLogForwarderNetworkPolicyName,
+		"ClusterLoggingNamespace":              "openshift-logging",
+		"KubernetesAPIServerCIDRs":             []string{"172.20.0.1/32"},
+		"InferenceNamespaces":                  []string{"redhat-ods-applications"},
+	}
+
+	// Must stay in step with the two pipeline actions' templates in
+	// actions.go, grouped the same way they are grouped there. The dependents
+	// carry the same component label as their stack because the storage gate
+	// withholds the pipeline as one unit: an unlabelled collector or
+	// forwarder dropped from the desired set would read to the sweep as a
+	// deletion.
+	for template, wantComponent := range map[string]string{
+		UsageLogsLokiStackTemplate:                  componentLokiUsageLogs,
+		UsageLogsLokiStackNPTemplate:                componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorTemplate:     componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorRBACTemplate: componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorNPTemplate:   componentLokiUsageLogs,
+		LokiStackTemplate:                           componentLokiLogs,
+		LokiStackNetworkPolicyTemplate:              componentLokiLogs,
+		LokiStackGatewayNetworkPolicyTemplate:       componentLokiLogs,
+		ClusterLogForwarderTemplate:                 componentLokiLogs,
+		ClusterLogForwarderRBACTemplate:             componentLokiLogs,
+		ClusterLogForwarderNetworkPolicyTemplate:    componentLokiLogs,
+	} {
+		t.Run(template, func(t *testing.T) {
+			t.Parallel()
+
+			// Only the component label is asserted here. part-of is the other
+			// half of the shield — it is the selector the collector lists by
+			// — but it is not a template contract: the deployer stamps it
+			// from the field owner for any object that arrives without one,
+			// which is why most operand CR templates omit it.
+			for _, resource := range renderObservabilityTemplate(t, template, data) {
+				if got := resource.GetLabels()[componentLabel]; got != wantComponent {
+					t.Errorf("%s %s: want %s=%s, got %q",
+						resource.GetKind(), resource.GetName(), componentLabel, wantComponent, got)
+				}
+			}
+		})
+	}
+}
+
 func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
 	t.Parallel()
 
@@ -698,6 +880,7 @@ func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
+	// The template must not aggregate extra metrics permissions into view/edit/admin.
 	for _, resource := range resources {
 		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
 			t.Fatal("namespace proxy must not aggregate extra permissions into view/edit/admin")
@@ -745,12 +928,14 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		t.Fatalf("namespace proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("namespace proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("namespace proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
+	// kube-rbac-proxy must forward to the method gate (:9092), not directly to
+	// prom-label-proxy (:9091), so GET/HEAD enforcement runs before label proxying.
 	assertContainerArgs(t, asMap(t, containers[0]),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -765,6 +950,34 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
+
+	// The method gate must be present (findContainer fails the test otherwise) and
+	// run the operator binary's "method-gate" subcommand, listening on :9092 and
+	// forwarding to prom-label-proxy on :9091. GET/HEAD enforcement is implemented
+	// in that subcommand, independent of RBAC.
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("method-gate command has unexpected type %T", gate["command"])
+	}
+	gateCommandStrs := make([]string, 0, len(gateCommand))
+	for _, c := range gateCommand {
+		s, ok := c.(string)
+		if !ok {
+			t.Fatalf("method-gate command element has unexpected type %T", c)
+		}
+		gateCommandStrs = append(gateCommandStrs, s)
+	}
+	for _, expected := range []string{
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	} {
+		if !slices.Contains(gateCommandStrs, expected) {
+			t.Errorf("method-gate command must contain %q, got %v", expected, gateCommandStrs)
+		}
+	}
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -1057,6 +1270,7 @@ func proxyTemplateData() map[string]any {
 		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
+		"HTTPMethodGateImage": "example.invalid/method-gate:test",
 		"TLSMinVersion":       proxyTLSVersion12,
 		"TLSCipherSuites":     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
 		"TLSCurvePreferences": "29,25",

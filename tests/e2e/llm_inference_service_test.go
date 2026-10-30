@@ -777,16 +777,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"name": "facebook/opt-125m",
 		},
 		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
+			"exporterEndpoint": fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
 			"sampler":          "always_on",
 		},
 		"replicas": int64(1),
 		"template": map[string]any{
+			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":  "main",
-					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+					"name":         "main",
+					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":          inferenceContainerEnv(),
+					"volumeMounts": serviceCAVolumeMounts(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -805,11 +807,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		// it does not contain a nested template. Unknown fields are pruned by
 		// the API server, so keep the containers directly under worker.
 		spec["worker"] = map[string]any{
+			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":  "main",
-					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+					"name":         "main",
+					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":          inferenceContainerEnv(),
+					"volumeMounts": serviceCAVolumeMounts(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -820,11 +824,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	case "disaggregated":
 		spec["prefill"] = map[string]any{
 			"template": map[string]any{
+				"volumes": serviceCAVolumes(),
 				"containers": []map[string]any{
 					{
-						"name":  "main",
-						"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-						"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+						"name":         "main",
+						"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+						"env":          inferenceContainerEnv(),
+						"volumeMounts": serviceCAVolumeMounts(),
 						"resources": map[string]any{
 							"requests": map[string]any{"memory": memory},
 							"limits":   map[string]any{"memory": memory},
@@ -979,6 +985,31 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		return true
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
+}
+
+func inferenceContainerEnv() []map[string]any {
+	return []map[string]any{
+		{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"},
+		{"name": "OTEL_EXPORTER_OTLP_CERTIFICATE", "value": "/var/run/secrets/service-ca/service-ca.crt"},
+	}
+}
+
+func serviceCAVolumeMounts() []map[string]any {
+	return []map[string]any{{
+		"name":      "service-ca",
+		"mountPath": "/var/run/secrets/service-ca",
+		"readOnly":  true,
+	}}
+}
+
+func serviceCAVolumes() []map[string]any {
+	return []map[string]any{{
+		"name": "service-ca",
+		"configMap": map[string]any{
+			"name":  "openshift-service-ca.crt",
+			"items": []map[string]any{{"key": "service-ca.crt", "path": "service-ca.crt"}},
+		},
+	}}
 }
 
 func logManualCleanupCommands(t *testing.T, topology, workloadNS, proxyNS, llmSvcName, bindingName string) {
@@ -1632,6 +1663,24 @@ func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext, platf
 	}
 }
 
+func requireUsageLogsMonitoringReady(t *testing.T, tc *TestContext) {
+	t.Helper()
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(gomega.And(
+			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
+			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
+			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
+		)),
+		WithEventuallyTimeout(10*time.Minute),
+		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
+	)
+}
+
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
@@ -1724,10 +1773,12 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		applyMonitoringManifest(t, tc, dir)
 	}
 
+	// This scenario configures usageLogs storage, so it is the usage logs
+	// LokiStack that must come up; the log forwarding one is never requested.
 	waitFor(
-		"LokiStack "+LokiStackName+" should be Ready",
+		"LokiStack "+UsageLogsLokiStackName+" should be Ready",
 		gvk.LokiStack,
-		types.NamespacedName{Name: LokiStackName, Namespace: inferenceMonitoringNamespace()},
+		types.NamespacedName{Name: UsageLogsLokiStackName, Namespace: inferenceMonitoringNamespace()},
 		"Ready",
 		20*time.Minute,
 	)
@@ -1744,25 +1795,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// write the Monitoring spec yourself, but this test does not: the spec propagates
 	// DSCI -> opendatahub-operator -> Monitoring. The guard above only proves the stanza
 	// survived the DSCI CRD, so confirm the ask landed here before trusting Degraded.
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
-		WithCondition(gomega.And(
-			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
-			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
-			// Every action function runs before AggregateReady in the same pass, so
-			// ProvisioningSucceeded=True means the feature conditions Degraded reads are from
-			// this reconcile. The early-return paths skip the aggregation and leave them stale.
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
-			// Implied by the above, but asserted directly because it is the artifact the envoy
-			// filter consumes. An absent field compares as null, so default it first.
-			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
-		)),
-		WithEventuallyTimeout(10*time.Minute),
-		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
-	)
+	requireUsageLogsMonitoringReady(t, tc)
 	waitFor(
 		"DSC default-dsc should be Ready",
 		schema.GroupVersionKind{
