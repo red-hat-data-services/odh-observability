@@ -151,13 +151,15 @@ func listAllNamespaces(ctx context.Context, c client.Client, fallback string) ([
 // TargetAllocator's per-namespace Secret read Role. Kubernetes does not have a
 // portable system-namespace marker, so account for the built-in namespaces and
 // the system markers used by OpenShift, HyperShift, and OLM.
+const kubeSystemNamespace = "kube-system"
+
 func isSystemNamespace(namespace *corev1.Namespace) bool {
 	if namespace == nil {
 		return true
 	}
 
 	switch namespace.Name {
-	case "", "default", "kube-system", "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
+	case "", "default", kubeSystemNamespace, "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
 		return true
 	}
 
@@ -192,14 +194,15 @@ func isSystemNamespace(namespace *corev1.Namespace) bool {
 // syncPrometheusWebTLSCA copies the service-ca.crt from the prometheus-web-tls-ca ConfigMap
 // into a same-named Secret so MonitoringStack can consume it.
 // This is a workaround until COO-1270 allows MonitoringStack to read CA from a ConfigMap.
-func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+// The bool reports whether the Secret contains the current injected CA.
+func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
 	log := logf.FromContext(ctx).WithName("syncPrometheusWebTLSCA")
 
 	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
-		return nil
+		return true, nil
 	}
 
-	namespace := monitoring.Spec.Namespace
+	namespace := monitoringNamespace(monitoring)
 
 	var configMap unstructured.Unstructured
 	configMap.SetAPIVersion("v1")
@@ -208,52 +211,61 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: prometheusWebTLSCAConfigMapName}, &configMap); err != nil {
 		if errors.IsNotFound(err) {
 			log.V(1).Info("CA ConfigMap not found yet, will sync when created")
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("failed to get CA ConfigMap: %w", err)
+		return false, fmt.Errorf("failed to get CA ConfigMap: %w", err)
 	}
 
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
 	if err != nil {
-		return fmt.Errorf("failed to extract data from ConfigMap: %w", err)
+		return false, fmt.Errorf("failed to extract data from ConfigMap: %w", err)
 	}
 	if !found {
 		log.V(1).Info("ConfigMap data field not found, service-ca operator may not have injected CA yet")
-		return nil
+		return false, nil
 	}
 
 	caCert, found := data[serviceCACertificateKey]
 	if !found || caCert == "" {
 		log.V(1).Info(serviceCACertificateKey + " not found in ConfigMap, service-ca operator may not have injected CA yet")
-		return nil
+		return false, nil
+	}
+
+	var current corev1.Secret
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: prometheusWebTLSCAConfigMapName}, &current); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, fmt.Errorf("failed to get CA Secret: %w", err)
+		}
+	} else if current.Type == corev1.SecretTypeOpaque && string(current.Data[serviceCACertificateKey]) == caCert {
+		return true, nil
 	}
 
 	secret := &unstructured.Unstructured{}
 	secret.SetAPIVersion("v1")
 	secret.SetKind("Secret")
 	secret.SetNamespace(namespace)
-	secret.SetName("prometheus-web-tls-ca")
+	secret.SetName(prometheusWebTLSCAConfigMapName)
 	// Do not label with PlatformPartOf — the Secret is not rendered via templates
 	// and is not in the GC desired set, so the label would cause GC to delete it
 	// every reconcile. The source ConfigMap has the label for Watch-based drift detection.
 
 	if err := unstructured.SetNestedField(secret.Object, "Opaque", "type"); err != nil {
-		return fmt.Errorf("failed to set secret type: %w", err)
+		return false, fmt.Errorf("failed to set secret type: %w", err)
 	}
 	// Use the `data` field with base64-encoded value so SSA field ownership is
 	// consistent with what the API server actually stores (it converts stringData
 	// to data on admission, creating a field-manager mismatch on subsequent applies).
 	encoded := base64.StdEncoding.EncodeToString([]byte(caCert))
 	if err := unstructured.SetNestedField(secret.Object, map[string]any{serviceCACertificateKey: encoded}, "data"); err != nil {
-		return fmt.Errorf("failed to set secret data: %w", err)
+		return false, fmt.Errorf("failed to set secret data: %w", err)
 	}
 
 	if err := c.Patch(ctx, secret, client.Apply, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("failed to apply CA Secret: %w", err)
+		return false, fmt.Errorf("failed to apply CA Secret: %w", err)
 	}
 
 	log.Info("Synced CA from ConfigMap to Secret", "namespace", namespace)
-	return nil
+	return true, nil
 }
 
 const thanosQuerierRouteName = "data-science-thanos-querier-route"
@@ -269,7 +281,7 @@ func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, m
 		return nil
 	}
 
-	namespace := monitoring.Spec.Namespace
+	namespace := monitoringNamespace(monitoring)
 	configMap := &unstructured.Unstructured{}
 	configMap.SetAPIVersion("v1")
 	configMap.SetKind("ConfigMap")
@@ -320,7 +332,7 @@ func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Mo
 
 	route := &routev1.Route{}
 	if err := c.Get(ctx, client.ObjectKey{
-		Namespace: monitoring.Spec.Namespace,
+		Namespace: monitoringNamespace(monitoring),
 		Name:      thanosQuerierRouteName,
 	}, route); err != nil {
 		monitoring.Status.URL = ""

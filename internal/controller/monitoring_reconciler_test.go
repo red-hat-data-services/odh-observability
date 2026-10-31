@@ -19,14 +19,19 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -48,8 +53,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
@@ -95,6 +102,91 @@ func newMonitoring(name string) *v1alpha1.Monitoring {
 	}
 }
 
+func TestPreparePrometheusWebTLSCA(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	ca := &unstructured.Unstructured{}
+	ca.SetGroupVersionKind(controllergvk.ConfigMap)
+	ca.SetName(prometheusWebTLSCAConfigMapName)
+	ca.SetNamespace(m.Spec.Namespace)
+	stack := &unstructured.Unstructured{}
+	stack.SetGroupVersionKind(controllergvk.MonitoringStack)
+	stack.SetName("data-science-monitoringstack")
+	stack.SetNamespace(m.Spec.Namespace)
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
+	collector.SetName("data-science-collector")
+	collector.SetNamespace(m.Spec.Namespace)
+	desired := []unstructured.Unstructured{*ca, *stack, *collector}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	r := newTestReconciler(t, s, cli)
+	ready, err := r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || ready {
+		t.Fatalf("expected CA to be pending before injection, got ready=%v error=%v", ready, err)
+	}
+
+	var created corev1.ConfigMap
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &created); err != nil {
+		t.Fatalf("CA ConfigMap was not applied before other resources: %v", err)
+	}
+	if got := withoutMonitoringStack(desired); len(got) != 2 || got[0].GetKind() != "ConfigMap" || got[1].GetKind() != "OpenTelemetryCollector" {
+		t.Fatalf("pending CA must omit only MonitoringStack, got %v", got)
+	}
+
+	created.Data = map[string]string{serviceCACertificateKey: "test-ca"}
+	if err := cli.Update(context.Background(), &created); err != nil {
+		t.Fatalf("injecting CA into ConfigMap: %v", err)
+	}
+	ready, err = r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || !ready {
+		t.Fatalf("expected CA Secret ready after injection, got ready=%v error=%v", ready, err)
+	}
+	var secret corev1.Secret
+	if err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: prometheusWebTLSCAConfigMapName}, &secret); err != nil {
+		t.Fatalf("CA Secret was not synchronized: %v", err)
+	}
+	if string(secret.Data[serviceCACertificateKey]) != "test-ca" {
+		t.Fatalf("CA Secret was not synchronized: data=%v", secret.Data)
+	}
+}
+
+func TestPreparePrometheusWebTLSCAUsesConfiguredMonitoringNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "custom-monitoring")
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	ca := &unstructured.Unstructured{}
+	ca.SetGroupVersionKind(controllergvk.ConfigMap)
+	ca.SetName(prometheusWebTLSCAConfigMapName)
+	ca.SetNamespace("custom-monitoring")
+	stack := &unstructured.Unstructured{}
+	stack.SetGroupVersionKind(controllergvk.MonitoringStack)
+	stack.SetName("data-science-monitoringstack")
+	stack.SetNamespace("custom-monitoring")
+	desired := []unstructured.Unstructured{*ca, *stack}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	r := newTestReconciler(t, s, cli)
+	ready, err := r.preparePrometheusWebTLSCA(context.Background(), m, desired)
+	if err != nil || ready {
+		t.Fatalf("expected CA to be pending, got ready=%v error=%v", ready, err)
+	}
+
+	var created corev1.ConfigMap
+	if err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: "custom-monitoring",
+		Name:      prometheusWebTLSCAConfigMapName,
+	}, &created); err != nil {
+		t.Fatalf("CA ConfigMap was not applied in the configured namespace: %v", err)
+	}
+}
+
 func registerOperatorConditionTypes(s *runtime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition",
@@ -102,6 +194,20 @@ func registerOperatorConditionTypes(s *runtime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorConditionList",
 	}, &unstructured.UnstructuredList{})
+}
+
+func registerClusterServiceVersionTypes(s *runtime.Scheme) {
+	s.AddKnownTypeWithName(controllergvk.ClusterServiceVersion, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(controllergvk.ClusterServiceVersion.GroupVersion().WithKind("ClusterServiceVersionList"),
+		&unstructured.UnstructuredList{})
+}
+
+func newClusterServiceVersion(name, phase string) *unstructured.Unstructured {
+	csv := &unstructured.Unstructured{}
+	csv.SetGroupVersionKind(controllergvk.ClusterServiceVersion)
+	csv.SetName(name)
+	_ = unstructured.SetNestedField(csv.Object, phase, "status", "phase")
+	return csv
 }
 
 func platformConfigMap(ns, version string) *corev1.ConfigMap {
@@ -136,6 +242,26 @@ func operatorConditionListForbidden() interceptor.Funcs {
 				return k8serr.NewForbidden(schema.GroupResource{Resource: "operatorconditions"}, "", errors.New("not allowed"))
 			}
 			return c.List(ctx, list, opts...)
+		},
+	}
+}
+
+func selfSubjectRulesReviewInterceptor(reviewErr error) interceptor.Funcs {
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); !ok {
+				return c.Create(ctx, obj, opts...)
+			}
+			if reviewErr != nil {
+				return reviewErr
+			}
+			// Serve the review directly instead of passing it through: the
+			// library creates it without a metadata.name, which the real API
+			// server assigns but the fake client rejects, so a passthrough
+			// turns every otherwise-clean sweep into a silent GC failure.
+			// The empty rule set models a namespace with no collectable
+			// resources.
+			return nil
 		},
 	}
 }
@@ -211,6 +337,18 @@ func TestValidateMonitoringNamespace(t *testing.T) {
 		}
 	})
 
+	t.Run("empty namespace uses the configured Helm namespace", func(t *testing.T) {
+		emptyNamespace := m.DeepCopy()
+		emptyNamespace.Spec.Namespace = ""
+		t.Setenv("MONITORING_NAMESPACE", "redhat-ods-monitoring")
+		if got := monitoringNamespace(emptyNamespace); got != "redhat-ods-monitoring" {
+			t.Fatalf("monitoringNamespace: want redhat-ods-monitoring, got %q", got)
+		}
+		if err := validateMonitoringNamespace(emptyNamespace); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
 	t.Run("mismatched configuration is rejected", func(t *testing.T) {
 		t.Setenv("MONITORING_NAMESPACE", "redhat-ods-monitoring")
 		if err := validateMonitoringNamespace(m); err == nil {
@@ -226,7 +364,8 @@ func TestReconcile_Removed(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.ManagementState = platformcommon.Removed
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -252,6 +391,21 @@ func TestReconcile_Removed(t *testing.T) {
 	}
 	if dependenciesReady != string(metav1.ConditionFalse) {
 		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady)
+	}
+}
+
+func TestReconcile_Removed_CleanupError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.ManagementState = platformcommon.Removed
+	cleanupErr := errors.New("rule review failed")
+
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
+
+	_, err := r.reconcile(context.Background(), m)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("expected cleanup error to be returned for retry, got %v", err)
 	}
 }
 
@@ -313,6 +467,226 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	}
 }
 
+func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		version          string
+		wantStatus       metav1.ConditionStatus
+		wantReason       string
+		wantSeverity     platformcommon.ConditionSeverity
+		wantMessageParts []string
+	}{
+		{
+			name:             "unsupported version is informational",
+			version:          "v1.4.0",
+			wantStatus:       metav1.ConditionFalse,
+			wantReason:       "UnsupportedVersion",
+			wantSeverity:     platformcommon.ConditionSeverityInfo,
+			wantMessageParts: []string{"v1.4.0", "v1.5.x"},
+		},
+		{
+			name:       "supported version is compatible",
+			version:    "v1.5.2",
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "Available",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestScheme(t)
+			registerOperatorConditionTypes(s)
+			registerClusterServiceVersionTypes(s)
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			m.Spec.Metrics = &v1alpha1.Metrics{
+				Storage: &v1alpha1.MetricsStorage{},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+				m,
+				newOperatorCondition("cluster-observability-operator."+tt.version),
+				newClusterServiceVersion("cluster-observability-operator."+tt.version, "Succeeded"),
+			).WithStatusSubresource(m).Build()
+			r := newTestReconciler(t, s, cli)
+
+			var previousTransitionTime *metav1.Time
+			if tt.wantStatus == metav1.ConditionTrue {
+				lastTransitionTime := metav1.NewTime(time.Now().Add(-time.Hour))
+				previousTransitionTime = &lastTransitionTime
+				m.Status.Conditions = append(m.Status.Conditions, platformcommon.Condition{
+					Type:               "COOVersionCompatible",
+					Status:             metav1.ConditionTrue,
+					Reason:             "Available",
+					LastTransitionTime: lastTransitionTime,
+				})
+			}
+
+			result, err := r.reconcile(context.Background(), m)
+			if err != nil {
+				t.Fatalf("reconcile returned error: %v", err)
+			}
+			if result.RequeueAfter != 5*time.Minute {
+				t.Errorf("RequeueAfter: want %s to refresh COO version, got %s", 5*time.Minute, result.RequeueAfter)
+			}
+
+			var compatibility, degraded *platformcommon.Condition
+			for i := range m.Status.Conditions {
+				condition := &m.Status.Conditions[i]
+				switch condition.Type {
+				case "COOVersionCompatible":
+					compatibility = condition
+				case string(platformcommon.ConditionTypeDegraded):
+					degraded = condition
+				}
+			}
+			if compatibility == nil {
+				t.Fatal("COOVersionCompatible condition was not reported")
+			}
+			if compatibility.Status != tt.wantStatus {
+				t.Errorf("COOVersionCompatible status: want %q, got %q", tt.wantStatus, compatibility.Status)
+			}
+			if compatibility.Reason != tt.wantReason {
+				t.Errorf("COOVersionCompatible reason: want %q, got %q", tt.wantReason, compatibility.Reason)
+			}
+			if compatibility.Severity != tt.wantSeverity {
+				t.Errorf("COOVersionCompatible severity: want %q, got %q", tt.wantSeverity, compatibility.Severity)
+			}
+			for _, expected := range tt.wantMessageParts {
+				if !strings.Contains(compatibility.Message, expected) {
+					t.Errorf("COOVersionCompatible message %q does not contain %q", compatibility.Message, expected)
+				}
+			}
+			if degraded == nil || degraded.Status != metav1.ConditionFalse {
+				t.Errorf("Degraded: want False for an informational COO compatibility warning, got %v", degraded)
+			}
+
+			if previousTransitionTime != nil {
+				if !compatibility.LastTransitionTime.Equal(previousTransitionTime) {
+					t.Errorf("COOVersionCompatible LastTransitionTime changed during reconcile: want %s, got %s",
+						previousTransitionTime, compatibility.LastTransitionTime)
+				}
+
+				if _, err := r.reconcile(context.Background(), m); err != nil {
+					t.Fatalf("second reconcile returned error: %v", err)
+				}
+				compatibility = mustFindCondition(t, m, "COOVersionCompatible")
+				if !compatibility.LastTransitionTime.Equal(previousTransitionTime) {
+					t.Errorf("COOVersionCompatible LastTransitionTime changed on second reconcile: want %s, got %s",
+						previousTransitionTime, compatibility.LastTransitionTime)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+	registerClusterServiceVersionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+	oldCSV := newClusterServiceVersion("cluster-observability-operator.v1.4.0", "Succeeded")
+	currentCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	_ = unstructured.SetNestedField(currentCSV.Object, oldCSV.GetName(), "spec", "replaces")
+
+	// OLM can leave an older OperatorCondition behind while the current CSV
+	// identifies the version that is actually installed.
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		m,
+		newOperatorCondition("cluster-observability-operator.v1.4.0"),
+		oldCSV,
+		currentCSV,
+	).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionTrue || compatibility.Reason != "Available" {
+		t.Fatalf("COOVersionCompatible: want True/Available from installed CSV, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityOnSuccessfulReconcile(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+	registerClusterServiceVersionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	caConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: prometheusWebTLSCAConfigMapName, Namespace: m.Spec.Namespace},
+		Data:       map[string]string{serviceCACertificateKey: "test-ca"},
+	}
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: prometheusWebTLSCAConfigMapName, Namespace: m.Spec.Namespace},
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{serviceCACertificateKey: []byte("test-ca")},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		m,
+		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+		newOperatorCondition("cluster-observability-operator.v1.4.0"),
+		newOperatorCondition("cert-manager-operator.v1.20.1"),
+		newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded"),
+		caConfigMap,
+		caSecret,
+	).WithStatusSubresource(m).WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error with all required operators installed: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionTrue || compatibility.Reason != "Available" {
+		t.Fatalf("COOVersionCompatible: want True/Available on successful reconcile, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
+	}
+	dependenciesReady := mustFindCondition(t, m, conditions.ConditionMonitoringDependenciesReady)
+	if dependenciesReady.Status != metav1.ConditionTrue {
+		t.Fatalf("MonitoringDependenciesReady: want True on successful reconcile, got %s", dependenciesReady.Status)
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityClearsWhenCOOMissing(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+	m.Status.Conditions = append(m.Status.Conditions, platformcommon.Condition{
+		Type:   "COOVersionCompatible",
+		Status: metav1.ConditionTrue,
+		Reason: "Available",
+	})
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionFalse || compatibility.Reason != "VersionUnavailable" {
+		t.Fatalf("COOVersionCompatible: want False/VersionUnavailable when COO is absent, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
+	}
+}
+
 func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 	s := newTestScheme(t)
 	registerOperatorConditionTypes(s)
@@ -333,10 +707,261 @@ func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 	if !k8serr.IsForbidden(err) {
 		t.Fatalf("expected forbidden lookup error, got: %v", err)
 	}
+	if m.Status.Phase != platformcommon.PhaseNotReady {
+		t.Fatalf("failed reconcile should set NotReady phase, got %s", m.Status.Phase)
+	}
+	for _, conditionType := range []string{string(platformcommon.ConditionTypeReady), string(platformcommon.ConditionTypeProvisioningSucceeded)} {
+		found := false
+		for _, condition := range m.Status.Conditions {
+			if condition.Type == conditionType {
+				found = condition.Status == metav1.ConditionFalse
+			}
+		}
+		if !found {
+			t.Errorf("%s must be False after reconciliation error", conditionType)
+		}
+	}
 	for _, condition := range m.Status.Conditions {
 		if condition.Reason == "MissingOperator" {
 			t.Errorf("lookup failure was incorrectly reported as a missing operator: %#v", condition)
 		}
+	}
+}
+
+func TestReconcileInvalidTLSProfilePreservesExistingWorkload(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	apiServer := strictAPIServer(configv1.VersionTLS10)
+	existingDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: m.Spec.Namespace,
+			Labels: map[string]string{
+				"platform.opendatahub.io/part-of": monitoringPartOf,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "kube-rbac-proxy",
+						Args: []string{"--tls-min-version=" + proxyTLSVersion12},
+					}},
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer, existingDeployment).
+		WithStatusSubresource(m).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	_, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("invalid proxy TLS profile should be a configuration error, got: %v", err)
+	}
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionFalse || ready.Reason != "ConfigurationError" {
+		t.Errorf("Ready: want False/ConfigurationError, got %s/%s", ready.Status, ready.Reason)
+	}
+	provisioning := mustFindCondition(t, m, string(platformcommon.ConditionTypeProvisioningSucceeded))
+	if provisioning.Status != metav1.ConditionFalse || provisioning.Reason != "ConfigurationError" {
+		t.Errorf("ProvisioningSucceeded: want False/ConfigurationError, got %s/%s", provisioning.Status, provisioning.Reason)
+	}
+	degraded := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded))
+	if degraded.Status != metav1.ConditionFalse || degraded.Reason != "NotDegraded" {
+		t.Errorf("Degraded: want False/NotDegraded, got %s/%s", degraded.Status, degraded.Reason)
+	}
+
+	var unchanged appsv1.Deployment
+	if err := cli.Get(context.Background(),
+		client.ObjectKey{Namespace: existingDeployment.Namespace, Name: existingDeployment.Name},
+		&unchanged); err != nil {
+		t.Fatalf("failed to get existing Deployment: %v", err)
+	}
+	gotArgs := unchanged.Spec.Template.Spec.Containers[0].Args
+	if len(gotArgs) != 1 || gotArgs[0] != "--tls-min-version="+proxyTLSVersion12 {
+		t.Fatalf("invalid TLS profile must preserve existing workload args, got: %#v", gotArgs)
+	}
+}
+
+func TestReconcileProxyTLSResolutionFailureReturnsError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer).
+		WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == "cluster" {
+					return k8serr.NewForbidden(
+						schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"},
+						key.Name,
+						errors.New("not allowed"),
+					)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	_, err := r.reconcile(context.Background(), m)
+	if !errors.Is(err, errProxyTLSResolutionFailed) {
+		t.Fatalf("expected proxy TLS resolution failure, got: %v", err)
+	}
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionFalse || ready.Reason != "ReconcileFailed" {
+		t.Errorf("Ready: want False/ReconcileFailed, got %s/%s", ready.Status, ready.Reason)
+	}
+	degraded := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded))
+	if degraded.Status != metav1.ConditionTrue {
+		t.Errorf("Degraded: want True, got %s", degraded.Status)
+	}
+}
+
+func TestTLSProfileChangeUpdatesProxyDeploymentPodTemplate(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Namespace = testMonitoringNamespace
+
+	apiServer := strictAPIServer(configv1.VersionTLS12)
+	legacyDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: m.Spec.Namespace,
+			Labels: map[string]string{
+				"platform.opendatahub.io/part-of": monitoringPartOf,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "kube-rbac-proxy",
+						Args: []string{
+							"--tls-min-version=" + proxyTLSVersion12,
+							"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+						},
+					}},
+				},
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer, legacyDeployment).
+		WithStatusSubresource(m).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	deployTLSProfile := func() appsv1.Deployment {
+		data := proxyTemplateData()
+		if err := addTLSData(context.Background(), cli, data); err != nil {
+			t.Fatalf("failed to resolve TLS profile: %v", err)
+		}
+		resources := renderObservabilityTemplate(t, PrometheusClusterProxyTemplate, data)
+		desired := findRenderedResource(t, resources, "Deployment", "data-science-prometheus-cluster-proxy")
+		if err := r.Deployer.Deploy(context.Background(), deploy.DeployInput{
+			Client:    cli,
+			Owner:     m,
+			Release:   deploy.ReleaseInfo{Type: platformType, Version: "test"},
+			Resources: []unstructured.Unstructured{desired},
+		}); err != nil {
+			t.Fatalf("failed to deploy proxy: %v", err)
+		}
+
+		var deployment appsv1.Deployment
+		if err := cli.Get(context.Background(),
+			client.ObjectKey{Namespace: m.Spec.Namespace, Name: "data-science-prometheus-cluster-proxy"},
+			&deployment); err != nil {
+			t.Fatalf("failed to get proxy Deployment: %v", err)
+		}
+		return deployment
+	}
+
+	deployment := deployTLSProfile()
+	if deployment.ResourceVersion == legacyDeployment.ResourceVersion {
+		t.Fatal("upgrading a legacy proxy Deployment must update its resource version")
+	}
+	args := deployment.Spec.Template.Spec.Containers[0].Args
+	if !slices.Contains(args, "--tls-min-version="+proxyTLSVersion12) ||
+		!slices.Contains(args, "--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256") ||
+		!slices.Contains(args, "--tls-curve-preferences=29,25") {
+		t.Fatalf("initial proxy args missing TLS settings: %#v", args)
+	}
+
+	apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{
+		Type: configv1.TLSProfileCustomType,
+		Custom: &configv1.CustomTLSProfile{
+			TLSProfileSpec: configv1.TLSProfileSpec{
+				MinTLSVersion: configv1.VersionTLS13,
+				Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
+				Groups: []configv1.TLSGroup{
+					configv1.TLSGroupSecP256r1,
+					configv1.TLSGroupX25519,
+				},
+			},
+		},
+	}
+	if err := cli.Update(context.Background(), apiServer); err != nil {
+		t.Fatalf("failed to update APIServer TLS profile: %v", err)
+	}
+
+	deployment = deployTLSProfile()
+	args = deployment.Spec.Template.Spec.Containers[0].Args
+	if !slices.Contains(args, "--tls-min-version="+proxyTLSVersion13) ||
+		!slices.Contains(args, "--tls-curve-preferences=23,29") {
+		t.Fatalf("updated proxy args missing TLS settings: %#v", args)
+	}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--tls-cipher-suites=") {
+			t.Fatalf("TLS 1.3 proxy args must not restrict cipher suites: %#v", args)
+		}
+	}
+}
+
+func strictAPIServer(minVersion configv1.TLSProtocolVersion) *configv1.APIServer {
+	return &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: minVersion,
+						Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+						Groups: []configv1.TLSGroup{
+							configv1.TLSGroupX25519,
+							configv1.TLSGroupSecP521r1,
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -392,11 +1017,15 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	// No Metrics/Traces configured: no operator precondition checks triggered.
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
-	_, err := r.reconcile(context.Background(), m)
+	result, err := r.reconcile(context.Background(), m)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter: want 0 when built-in metrics storage is not configured, got %s", result.RequeueAfter)
 	}
 
 	var ready, degraded, dependenciesReady, legacyAvailable string
@@ -423,6 +1052,107 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	}
 	if legacyAvailable != dependenciesReady {
 		t.Errorf("legacy MonitoringAvailable status %q does not match MonitoringDependenciesReady %q", legacyAvailable, dependenciesReady)
+	}
+}
+
+func TestReconcile_CleansOperatorNetworkPoliciesInEffectiveNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", defaultMonitoringNamespace)
+
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+
+	stalePolicy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      collectorOperatorNetworkPolicyName,
+			Namespace: defaultMonitoringNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  openTelemetryCollectorComponent,
+				"app.kubernetes.io/instance":   defaultMonitoringNamespace + ".data-science-collector",
+				"app.kubernetes.io/managed-by": opentelemetryOperator,
+				"app.kubernetes.io/part-of":    openTelemetryPartOf,
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, stalePolicy).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(stalePolicy), &networkingv1.NetworkPolicy{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("expected generated policy in effective namespace to be deleted, got %v", err)
+	}
+}
+
+// TestReconcile_GarbageCollectionError: a failed garbage collection sweep is
+// logged and the reconcile still succeeds — GC is fault tolerant by design, so
+// one failed sweep must not fail the round and mark the whole Monitoring
+// degraded. But swallowing alone would strand the sweep: with no watch events
+// there is no retry, and stale owned resources could outlive their desired
+// state indefinitely while status reports success. The explicit requeue is the
+// other half of the contract. Removal is different: deleteAllOwned on Removed
+// still returns its error for retry (TestReconcile_Removed_CleanupError).
+func TestReconcile_GarbageCollectionError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cleanupErr := errors.New("rule review failed")
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
+
+	result, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("garbage collection error must not fail the reconcile, got %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("a failed garbage collection sweep must schedule an explicit requeue, or stale owned resources wait on an unrelated watch event")
+	}
+}
+
+// TestReconcile_GarbageCollectionTransientFailure: the requeue above exists
+// for transient failures, so the recovery half needs pinning too — once the
+// sweep succeeds again, the reconcile must stop requeueing and report success.
+// The fake discovery client exposes no API resources, so the recovered sweep
+// finds nothing to delete; what this guards is that the failure flag does not
+// latch and turn a healed controller into a permanent one-minute poller.
+func TestReconcile_GarbageCollectionTransientFailure(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	// Fail only the first SelfSubjectRulesReview, then serve the rest
+	// directly — the fake client rejects the nameless review that the real
+	// API server would accept (see selfSubjectRulesReviewInterceptor).
+	sweeps := 0
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); ok {
+					sweeps++
+					if sweeps == 1 {
+						return errors.New("rule review failed")
+					}
+					return nil
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).Build())
+
+	result, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("failed sweep must not fail the reconcile, got %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("failed sweep must schedule a requeue so a transient failure is retried")
+	}
+
+	result, err = r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("reconcile after the sweep recovered must succeed, got %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("a recovered sweep must clear the requeue, got %v", result.RequeueAfter)
 	}
 }
 
@@ -506,7 +1236,8 @@ func TestReconcile_ReleasesPopulated(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -550,7 +1281,8 @@ func TestReconcile_PlatformVersionStampedIntoStatus(t *testing.T) {
 
 	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).
 		WithObjects(m, platformConfigMap(ns, version)).
-		WithStatusSubresource(m).Build())
+		WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -745,7 +1477,7 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 	staleTargetBinding := ownedGarbageCollectionTestObject(controllergvk.RoleBinding, "team-a", targetAllocatorSecretRBACName, monitoring.UID)
 	otherMonitoringRole := ownedGarbageCollectionTestObject(controllergvk.Role, "team-a", targetAllocatorSecretRBACName, types.UID("other-monitoring"))
 	staleMonitoringConfigMap := ownedGarbageCollectionTestObject(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, monitoring.Spec.Namespace, "stale-config", monitoring.UID)
-	clusterRole := ownedGarbageCollectionTestObject(controllergvk.ClusterRole, "", "stale-cluster-role", monitoring.UID)
+	clusterRole := ownedGarbageCollectionTestObject(controllergvk.ClusterRole, "", "data-science-metrics-view", monitoring.UID)
 
 	desiredTargetRole := resourceKey{
 		gvk:       staleTargetRole.GroupVersionKind(),
@@ -813,10 +1545,13 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := shouldCollectOwnedResource(monitoring, test.obj, test.desired, monitoring.Spec.Namespace); got != test.wantMainGC {
+			if got := shouldCollectOwnedResource(
+				monitoring, test.obj, test.desired, monitoring.Spec.Namespace, nil); got != test.wantMainGC {
 				t.Errorf("main GC eligibility: want %t, got %t", test.wantMainGC, got)
 			}
-			if got := shouldCollectTargetAllocatorRBAC(monitoring, test.obj, test.desired); got != test.wantTargetGC {
+			if got := shouldCollectTargetAllocatorRBAC(
+				monitoring, &test.obj, test.obj.GroupVersionKind(), test.desired,
+			); got != test.wantTargetGC {
 				t.Errorf("TargetAllocator GC eligibility: want %t, got %t", test.wantTargetGC, got)
 			}
 		})
@@ -824,8 +1559,789 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 
 	withoutUID := monitoring.DeepCopy()
 	withoutUID.UID = ""
-	if shouldCollectTargetAllocatorRBAC(withoutUID, staleTargetRole, nil) {
+	if shouldCollectTargetAllocatorRBAC(withoutUID, &staleTargetRole, staleTargetRole.GroupVersionKind(), nil) {
 		t.Error("GC must fail closed when the Monitoring UID is unavailable")
+	}
+}
+
+func TestScopedClusterRBACGarbageCollection(t *testing.T) {
+	scheme := newTestScheme(t)
+	monitoring := newMonitoring(v1alpha1.MonitoringInstanceName)
+	monitoring.UID = types.UID("monitoring-owner")
+	controller := true
+	ownerReference := metav1.OwnerReference{
+		APIVersion: v1alpha1.GroupVersion.String(),
+		Kind:       "Monitoring",
+		Name:       monitoring.Name,
+		UID:        monitoring.UID,
+		Controller: &controller,
+	}
+	labels := map[string]string{odhLabels.PlatformPartOf: monitoringPartOf}
+
+	clusterRole := func(name string) *rbacv1.ClusterRole {
+		return &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+	clusterRoleBinding := func(name string) *rbacv1.ClusterRoleBinding {
+		return &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+	otherOwnerReference := ownerReference
+	otherOwnerReference.UID = types.UID("other-monitoring")
+
+	staleRole := clusterRole("data-science-collector-mlflow-trace-export")
+	desiredRole := clusterRole("generate-processors-role")
+	otherOwnerRole := clusterRole("data-science-collector-tempo-trace-export")
+	unknownRole := clusterRole("unrelated-owned-role")
+	staleBinding := clusterRoleBinding("data-science-collector-mlflow-trace-export")
+	desiredBinding := clusterRoleBinding("generate-processors-collector-rolebinding")
+	managedFalseRole := clusterRole("data-science-metrics-view")
+	withheldRole := clusterRole("data-science-usage-logs-processor")
+
+	otherOwnerRole.OwnerReferences = []metav1.OwnerReference{otherOwnerReference}
+	managedFalseRole.Annotations = map[string]string{"opendatahub.io/managed": "false"}
+	withheldRole.Labels = map[string]string{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+		componentLabel:           componentLokiUsageLogs,
+	}
+	reconciler := &MonitoringReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(
+				staleRole, desiredRole, otherOwnerRole, unknownRole, staleBinding, desiredBinding,
+				managedFalseRole, withheldRole,
+			).
+			Build(),
+	}
+
+	err := reconciler.collectScopedClusterRBACGarbage(
+		context.Background(), monitoring,
+		map[resourceKey]struct{}{
+			{gvk: controllergvk.ClusterRole, name: desiredRole.Name}:           {},
+			{gvk: controllergvk.ClusterRoleBinding, name: desiredBinding.Name}: {},
+		},
+		map[string]struct{}{componentLokiUsageLogs: {}},
+	)
+	if err != nil {
+		t.Fatalf("scoped RBAC garbage collection returned an error: %v", err)
+	}
+
+	for name, exists := range map[string]bool{
+		staleRole.Name:        false,
+		staleBinding.Name:     false,
+		desiredRole.Name:      true,
+		desiredBinding.Name:   true,
+		otherOwnerRole.Name:   true,
+		unknownRole.Name:      true,
+		managedFalseRole.Name: true,
+		withheldRole.Name:     true,
+	} {
+		role := &rbacv1.ClusterRole{}
+		roleErr := reconciler.Get(context.Background(), types.NamespacedName{Name: name}, role)
+		binding := &rbacv1.ClusterRoleBinding{}
+		bindingErr := reconciler.Get(context.Background(), types.NamespacedName{Name: name}, binding)
+		found := roleErr == nil || bindingErr == nil
+		if found != exists {
+			t.Errorf("%s: found=%t, want %t", name, found, exists)
+		}
+	}
+}
+
+func TestTargetAllocatorRBACGarbageCollection(t *testing.T) {
+	scheme := newTestScheme(t)
+	monitoring := newMonitoring(v1alpha1.MonitoringInstanceName)
+	monitoring.UID = types.UID("monitoring-owner")
+	controller := true
+	ownerReference := metav1.OwnerReference{
+		APIVersion: v1alpha1.GroupVersion.String(),
+		Kind:       "Monitoring",
+		Name:       monitoring.Name,
+		UID:        monitoring.UID,
+		Controller: &controller,
+	}
+	labels := map[string]string{odhLabels.PlatformPartOf: monitoringPartOf}
+
+	role := func(namespace string) *rbacv1.Role {
+		return &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            targetAllocatorSecretRBACName,
+				Namespace:       namespace,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+	roleBinding := func(namespace string) *rbacv1.RoleBinding {
+		return &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            targetAllocatorSecretRBACName,
+				Namespace:       namespace,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+
+	staleRole := role("team-a")
+	desiredRole := role("team-b")
+	managedFalseRole := role("team-c")
+	managedFalseRole.Annotations = map[string]string{"opendatahub.io/managed": "false"}
+	otherOwnerRole := role("team-d")
+	otherOwnerRole.OwnerReferences[0].UID = types.UID("other-monitoring")
+	unlabelledRole := role("team-e")
+	unlabelledRole.Labels = nil
+
+	staleBinding := roleBinding("team-a")
+	desiredBinding := roleBinding("team-b")
+	reconciler := &MonitoringReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(
+				staleRole, desiredRole, managedFalseRole, otherOwnerRole, unlabelledRole,
+				staleBinding, desiredBinding,
+			).
+			Build(),
+	}
+
+	err := reconciler.collectTargetAllocatorRBACGarbage(context.Background(), monitoring, map[resourceKey]struct{}{
+		{gvk: controllergvk.Role, namespace: desiredRole.Namespace, name: desiredRole.Name}:              {},
+		{gvk: controllergvk.RoleBinding, namespace: desiredBinding.Namespace, name: desiredBinding.Name}: {},
+	})
+	if err != nil {
+		t.Fatalf("TargetAllocator RBAC garbage collection returned an error: %v", err)
+	}
+
+	for name, namespace := range map[string]string{
+		staleRole.Name:        "team-a",
+		staleBinding.Name:     "team-a",
+		desiredRole.Name:      "team-b",
+		desiredBinding.Name:   "team-b",
+		managedFalseRole.Name: "team-c",
+		otherOwnerRole.Name:   "team-d",
+		unlabelledRole.Name:   "team-e",
+	} {
+		roleErr := reconciler.Get(context.Background(), types.NamespacedName{
+			Namespace: namespace,
+			Name:      name,
+		}, &rbacv1.Role{})
+		bindingErr := reconciler.Get(context.Background(), types.NamespacedName{
+			Namespace: namespace,
+			Name:      name,
+		}, &rbacv1.RoleBinding{})
+		found := roleErr == nil || bindingErr == nil
+		wantFound := namespace != "team-a"
+		if found != wantFound {
+			t.Errorf("%s/%s: found=%t, want %t", namespace, name, found, wantFound)
+		}
+	}
+}
+
+func TestScopedRBACDeleteOptionsIncludeIdentityPreconditions(t *testing.T) {
+	t.Parallel()
+
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "data-science-collector-mlflow-trace-export",
+			UID:             types.UID("scoped-role-uid"),
+			ResourceVersion: "42",
+		},
+	}
+
+	options := scopedRBACDeleteOptions(role)
+	if options.Preconditions == nil {
+		t.Fatal("scoped RBAC delete must set identity preconditions")
+	}
+	if options.Preconditions.UID == nil || *options.Preconditions.UID != role.UID {
+		t.Errorf("scoped RBAC delete UID precondition: got %v, want %s", options.Preconditions.UID, role.UID)
+	}
+	if options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != role.ResourceVersion {
+		t.Errorf("scoped RBAC delete resourceVersion precondition: got %v, want %q", options.Preconditions.ResourceVersion, role.ResourceVersion)
+	}
+}
+
+func TestIsOpenTelemetryOperatorNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+		"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+		"app.kubernetes.io/part-of":    "opentelemetry",
+	}}}
+	if !isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("expected the generated TargetAllocator policy to be identified")
+	}
+
+	policy.Labels["app.kubernetes.io/managed-by"] = "odh-observability"
+	if isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("module-owned policy must not be identified as an Operator-generated policy")
+	}
+}
+
+func TestCleanupOpenTelemetryOperatorNetworkPolicies(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	stale := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-collector-targetallocator-networkpolicy",
+			Namespace: "opendatahub",
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+				"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+				"app.kubernetes.io/managed-by": "opentelemetry-operator",
+				"app.kubernetes.io/part-of":    "opentelemetry",
+			},
+		},
+	}
+	reconciler := &MonitoringReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(stale).Build()}
+	if err := reconciler.cleanupOpenTelemetryOperatorNetworkPolicies(context.Background(), stale.Namespace); err != nil {
+		t.Fatalf("cleanup returned an error: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stale), &networkingv1.NetworkPolicy{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("expected generated policy to be deleted, got %v", err)
+	}
+}
+
+func TestOpenTelemetryOperatorNetworkPolicyWatch(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "monitoring-test")
+	pred := predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent)
+	for _, test := range []struct {
+		name      string
+		policy    string
+		component string
+		mutate    func(*networkingv1.NetworkPolicy)
+		want      bool
+	}{
+		{name: "collector recreated", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector", want: true},
+		{name: "allocator recreated", policy: "data-science-collector-targetallocator-networkpolicy", component: "opentelemetry-targetallocator", want: true},
+		{name: "other policy name", policy: "user-policy", component: "opentelemetry-collector"},
+		{name: "wrong component", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-targetallocator"},
+		{name: "other namespace", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Namespace = "other" }},
+		{name: "other collector", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels["app.kubernetes.io/instance"] = "monitoring-test.other" }},
+		{name: "unlabeled policy", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+				Name: test.policy, Namespace: "monitoring-test",
+				Labels: map[string]string{
+					"app.kubernetes.io/component":  test.component,
+					"app.kubernetes.io/instance":   "monitoring-test.data-science-collector",
+					"app.kubernetes.io/managed-by": "opentelemetry-operator",
+					"app.kubernetes.io/part-of":    "opentelemetry",
+				},
+			}}
+			if test.mutate != nil {
+				test.mutate(policy)
+			}
+			if got := pred.Create(event.CreateEvent{Object: policy}); got != test.want {
+				t.Fatalf("create event: got %t, want %t", got, test.want)
+			}
+			if got := pred.Update(event.UpdateEvent{ObjectOld: policy.DeepCopy(), ObjectNew: policy}); got != test.want {
+				t.Fatalf("update event: got %t, want %t", got, test.want)
+			}
+		})
+	}
+	if pred.Create(event.CreateEvent{Object: &corev1.ConfigMap{}}) {
+		t.Fatal("a non-NetworkPolicy event must not trigger legacy policy cleanup")
+	}
+}
+
+// TestStorageSecretRequests covers the watch that makes failing closed on an
+// unresolved storage Secret survivable.
+//
+// The storage Secrets belong to the user, carry no part-of label, and so are
+// invisible to the managed-resource predicate the other Secret watch uses.
+// Without this mapping a Secret applied after the Monitoring CR is not noticed
+// until the periodic requeue, and both LokiStacks stay withheld for that whole
+// window. The mapping runs on every Secret event in the cluster, so what it
+// declines to enqueue matters as much as what it enqueues.
+func TestStorageSecretRequests(t *testing.T) {
+	const ns = "test-ns"
+
+	configured := func() *v1alpha1.Monitoring {
+		return monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	}
+
+	for _, test := range []struct {
+		name        string
+		monitoring  *v1alpha1.Monitoring
+		secret      *corev1.Secret
+		wantEnqueue bool
+	}{
+		{
+			name:        "the usage logs storage secret enqueues",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: ns}},
+			wantEnqueue: true,
+		},
+		{
+			// Both names have to be matched: covering only the first would
+			// leave log forwarding waiting on the requeue it was the point
+			// of this watch to avoid.
+			name:        "the log forwarding storage secret enqueues",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: true,
+		},
+		{
+			name:        "an unrelated secret in the monitoring namespace does not",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-other-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+		{
+			// Secret names are not unique across the cluster, and this sees
+			// every namespace. Matching on name alone would have any tenant's
+			// "logs-secret" drive reconciliation of the platform's Monitoring.
+			name:        "the same name in another namespace does not",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: "other-ns"}},
+			wantEnqueue: false,
+		},
+		{
+			// Teardown: the CR is gone, so there is nothing to enqueue and
+			// nothing worth logging about it either.
+			name:        "no Monitoring CR does not",
+			monitoring:  nil,
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+		{
+			// Storage is required within UsageLogs and Logs, but both of
+			// those are optional, so the nil checks are reachable.
+			name: "a secret named by an unconfigured feature does not",
+			monitoring: func() *v1alpha1.Monitoring {
+				m := configured()
+				m.Spec.Logs = nil
+				return m
+			}(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newActionsTestScheme(t)
+
+			builder := fake.NewClientBuilder().WithScheme(s)
+			if test.monitoring != nil {
+				builder = builder.WithObjects(test.monitoring)
+			}
+			r := newTestReconciler(t, s, builder.Build())
+
+			got := r.storageSecretRequests(context.Background(), test.secret)
+
+			if !test.wantEnqueue {
+				if len(got) != 0 {
+					t.Fatalf("expected no requests, got %v", got)
+				}
+				return
+			}
+			want := []reconcile.Request{
+				{NamespacedName: types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("requests: want %v, got %v", want, got)
+			}
+		})
+	}
+}
+
+// TestStorageConflictShieldsLokiFromGarbageCollection covers the resolution of
+// a rejected storage configuration: validateStorageIsolation stops before either
+// stack action runs, so nothing is rendered, and every claimant's component is
+// shielded so the collector does not read that absence as "the user removed
+// log storage". Collection itself keeps running, which is what separates this
+// from disabling GC for the whole reconcile.
+//
+// It drives shouldCollectOwnedResource against hand-built withheld sets so it
+// can cover combinations the reconciler cannot produce in one round, including
+// the asymmetric one the two component labels exist for.
+// TestReconcile_StorageConflictWithholdsBothStacks covers the wiring that
+// produces those sets.
+func TestStorageConflictShieldsLokiFromGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	s := newActionsTestScheme(t)
+	registerCRDs(s, controllergvk.LokiStack)
+
+	monitoring := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	monitoring.UID = types.UID("monitoring-owner")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		kubernetesAPIServerEndpointSlice(),
+		lokiStorageSecret("usage-logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
+	withheld, lokiErr := validateStorageIsolation(ctx, cli, monitoring, cm)
+	if lokiErr == nil {
+		t.Fatal("expected the shared bucket to be rejected")
+	}
+
+	// The gate owns the shield, so the set it hands back is the contract: both
+	// claimants refused, both shielded.
+	wantWithheld := map[string]struct{}{componentLokiUsageLogs: {}, componentLokiLogs: {}}
+	if !reflect.DeepEqual(withheld, wantWithheld) {
+		t.Fatalf("withheld components: want %v, got %v", wantWithheld, withheld)
+	}
+
+	// Nothing was rendered, so the desired set is empty and only the shield can
+	// save the live resources.
+	desired := map[resourceKey]struct{}{}
+
+	ns := monitoring.Spec.Namespace
+	labelled := func(gvk schema.GroupVersionKind, namespace, name, component string) unstructured.Unstructured {
+		obj := ownedGarbageCollectionTestObject(gvk, namespace, name, monitoring.UID)
+		obj.SetLabels(map[string]string{componentLabel: component})
+		return obj
+	}
+
+	// Every resource the two pipeline actions render, by the label its template
+	// carries. The dependents carry their stack's label because the gate
+	// withholds the pipeline as one unit: an unlabelled collector or forwarder
+	// dropped from the desired set would read to the sweep as a deletion.
+	usageLogsResources := []unstructured.Unstructured{
+		labelled(controllergvk.LokiStack, ns, usageLogsLokiStackResourceName, componentLokiUsageLogs),
+		labelled(controllergvk.NetworkPolicy, ns, usageLogsLokiStackResourceName+"-allow", componentLokiUsageLogs),
+		labelled(controllergvk.OpenTelemetryCollector, ns, "data-science-usage-logs", componentLokiUsageLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-usage-logs-collector-allow", componentLokiUsageLogs),
+		labelled(controllergvk.ClusterRole, "", "data-science-usage-logs-processor", componentLokiUsageLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", "data-science-usage-logs-processor", componentLokiUsageLogs),
+	}
+	logsResources := []unstructured.Unstructured{
+		labelled(controllergvk.LokiStack, ns, lokiStackResourceName, componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-ingress", componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-gateway-ingress", componentLokiLogs),
+		labelled(controllergvk.ClusterLogForwarder, clusterLoggingNamespace, clusterLogForwarderResourceName, componentLokiLogs),
+		labelled(controllergvk.ServiceAccount, clusterLoggingNamespace, clusterLogForwarderResourceName+"-collector", componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, clusterLoggingNamespace, ClusterLogForwarderNetworkPolicyName, componentLokiLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", clusterLogForwarderResourceName+"-collector-collect-app-logs", componentLokiLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", clusterLogForwarderResourceName+"-collector-loki-writer", componentLokiLogs),
+	}
+	for _, live := range append(append([]unstructured.Unstructured{}, usageLogsResources...), logsResources...) {
+		if shouldCollectOwnedResource(monitoring, live, desired, ns, withheld) {
+			t.Errorf("%s %s would be deleted while its storage configuration is rejected",
+				live.GetKind(), live.GetName())
+		}
+	}
+
+	// The reason the two stacks carry different labels. Shielding usage logs
+	// must not shield log forwarding: if the user removed spec.logs in the same
+	// round, those resources are a deletion the operator owes them, and one
+	// claimant's storage problem is no reason to withhold it.
+	usageLogsOnly := map[string]struct{}{componentLokiUsageLogs: {}}
+	for _, live := range logsResources {
+		if live.GroupVersionKind() == controllergvk.LokiStack {
+			// Covered by the GVK fallback below, which is deliberately coarser.
+			continue
+		}
+		if !shouldCollectOwnedResource(monitoring, live, desired, ns, usageLogsOnly) {
+			t.Errorf("%s %s: log forwarding resources must be collected while only usage logs is withheld",
+				live.GetKind(), live.GetName())
+		}
+	}
+	for _, live := range usageLogsResources {
+		if shouldCollectOwnedResource(monitoring, live, desired, ns, usageLogsOnly) {
+			t.Errorf("%s %s would be deleted while usage logs storage is withheld",
+				live.GetKind(), live.GetName())
+		}
+	}
+
+	// Upgrade case: a stack created before componentLabel existed carries no
+	// label, so only the GVK fallback stands between it and deletion. It cannot
+	// tell which stack the unlabelled object belongs to, so either component
+	// being withheld has to be enough.
+	unlabelled := ownedGarbageCollectionTestObject(controllergvk.LokiStack, ns, lokiStackResourceName, monitoring.UID)
+	for name, set := range map[string]map[string]struct{}{
+		"both withheld":            withheld,
+		"usage logs only withheld": usageLogsOnly,
+		"log forwarding only withheld": {
+			componentLokiLogs: {},
+		},
+	} {
+		if shouldCollectOwnedResource(monitoring, unlabelled, desired, ns, set) {
+			t.Errorf("%s: an unlabelled LokiStack from an older release must still be shielded", name)
+		}
+	}
+
+	// Unrelated resources are still collected; the conflict degrades Loki only.
+	staleConfigMap := ownedGarbageCollectionTestObject(
+		schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, ns, "stale-config", monitoring.UID)
+	if !shouldCollectOwnedResource(monitoring, staleConfigMap, desired, ns, withheld) {
+		t.Error("unrelated stale resources must still be collected, the conflict must not disable garbage collection")
+	}
+
+	// Without a conflict the shield lifts entirely, so removing log storage from
+	// the spec still prunes. A shield that never lifts would strand them forever.
+	//
+	// The LokiStack is checked alongside the policies because it is the one
+	// resource with a second, GVK-based shield. That fallback has to be gated on
+	// a loki component actually being withheld: ungated, it would make a
+	// LokiStack uncollectable, and a stack the user has removed from the spec
+	// would outlive its configuration indefinitely.
+	for _, live := range append(append([]unstructured.Unstructured{unlabelled}, usageLogsResources...), logsResources...) {
+		if !shouldCollectOwnedResource(monitoring, live, desired, ns, nil) {
+			t.Errorf("%s %s: loki resources absent from the desired set must be collected when nothing is withheld",
+				live.GetKind(), live.GetName())
+		}
+	}
+}
+
+// lokiReconcileFixture builds the smallest cluster in which reconcile reaches
+// the Loki section: both stacks configured, the three operators their
+// preconditions demand installed, and the LokiStack kind registered so CRD
+// discovery answers yes. Callers add the storage Secrets, which is the only
+// thing the Loki tests below actually vary.
+func lokiReconcileFixture(t *testing.T) (*runtime.Scheme, *v1alpha1.Monitoring, []client.Object) {
+	t.Helper()
+
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+	registerCRDs(s, controllergvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	m.UID = types.UID("monitoring-owner")
+
+	operators := []string{
+		"opentelemetry-operator.v0.158.0-1",
+		"loki-operator.v6.4.0",
+		"cluster-logging.v6.4.0",
+	}
+	objects := make([]client.Object, 0, len(operators)+2)
+	objects = append(objects, m, kubernetesAPIServerEndpointSlice())
+	for _, operator := range operators {
+		objects = append(objects, newOperatorCondition(operator))
+	}
+	return s, m, objects
+}
+
+// liveLokiStacks returns the two stacks as they would already exist in the
+// cluster, labelled the way their templates label them.
+func liveLokiStacks(namespace string) []client.Object {
+	stack := func(name, component string) client.Object {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(controllergvk.LokiStack)
+		obj.SetNamespace(namespace)
+		obj.SetName(name)
+		obj.SetLabels(map[string]string{componentLabel: component})
+		return obj
+	}
+	return []client.Object{
+		stack(usageLogsLokiStackResourceName, componentLokiUsageLogs),
+		stack(lokiStackResourceName, componentLokiLogs),
+	}
+}
+
+// TestReconcile_StorageConflictWithholdsBothStacks pins the sequencing the
+// reconciler owns: the storage gate runs before the two stack actions, and
+// when it refuses a configuration neither action runs.
+//
+// This has to be driven through reconcile. The gate and the actions each hold
+// up on their own — their own tests cover that — but the order they run in and
+// the decision to skip past them live in reconcile and nowhere else, and a
+// helper that re-stated that order would be testing the helper.
+func TestReconcile_StorageConflictWithholdsBothStacks(t *testing.T) {
+	ctx := context.Background()
+	s, m, objects := lokiReconcileFixture(t)
+
+	// One bucket between the two of them.
+	objects = append(objects,
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	)
+	objects = append(objects, liveLokiStacks(m.Spec.Namespace)...)
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	// The error is not asserted on, and the sweep is not reached. Deploy uses
+	// server-side apply, which the fake client cannot do across a mix of typed
+	// and unstructured objects, so every reconcile here returns "applying
+	// resources" before the held storage error or collectGarbage. The shield
+	// itself is covered against shouldCollectOwnedResource directly, above.
+	if _, err := r.reconcile(ctx, m); err == nil {
+		t.Fatal("expected a rejected storage configuration to fail the reconcile")
+	}
+
+	// What this does pin, and the reason it has to run through reconcile:
+	// neither stack action ran. Both would have written their own verdict over
+	// the gate's — LokiStackNotReady, from observing stacks the operator never
+	// agreed to create — so a surviving StorageConflict is the proof that the
+	// gate ran first and that the withheld set was honoured.
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != storageConflictReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, storageConflictReason, c.Status, c.Reason)
+		}
+	}
+
+	// The dependents no longer have actions of their own to write their
+	// conditions, so the withheld branch mirrors the gate's verdict onto them.
+	// A stale True here would report a shipping pipeline while it is frozen.
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsCollectorAvailable,
+		conditions.ConditionClusterLogForwarderAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != storageConflictReason {
+			t.Errorf("%s: expected the mirrored False/%s, got %s/%s", conditionType, storageConflictReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestReconcile_LokiCRDDiscoveryFailureAbortsBeforeGarbageCollection pins the
+// property that lets deployLokiStack ask about the CRD at all.
+//
+// That branch returns with none of its templates appended, and a template
+// missing from the desired set is indistinguishable, to the collector, from
+// one the user deleted. It is safe only because the error aborts the round the
+// way every other action's does: no apply, no sweep, backoff, retry. Hold it
+// to the end instead and the sweep deletes the live stack.
+//
+// Only usage logs are configured. The ClusterLogForwarder's own CRD check now
+// runs inside the log forwarding stack's action, behind its deployLokiStack —
+// which asks the same question with a byte-identical message — so with
+// Spec.Logs set the error assertion below could pass on either abort without
+// proving which check fired. Spec.Logs=nil keeps the forwarder out of the
+// round entirely, and the condition assertion — which only deployLokiStack
+// writes — is what proves the check under test is the one that fired.
+func TestReconcile_LokiCRDDiscoveryFailureAbortsBeforeGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	s, m, objects := lokiReconcileFixture(t)
+	m.Spec.Logs = nil
+
+	objects = append(objects,
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "usage-logs-bucket"),
+	)
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if list.GetObjectKind().GroupVersionKind().Kind == controllergvk.LokiStack.Kind+"List" {
+					return k8serr.NewForbidden(
+						schema.GroupResource{Resource: "lokistacks"}, "", errors.New("no permission"))
+				}
+				return c.List(ctx, list, opts...)
+			},
+		}).Build()
+	r := newTestReconciler(t, s, cli)
+
+	// The stack was up as of the previous round, so the condition below is an
+	// invalidation rather than a first write.
+	m.Status.Conditions = nil
+	conditions.NewConditionsManager(m, m.Generation).
+		MarkTrue(conditions.ConditionUsageLogsLokiStackAvailable)
+
+	_, err := r.reconcile(ctx, m)
+	if err == nil {
+		t.Fatal("expected CRD discovery failure to abort the reconcile")
+	}
+	if !strings.Contains(err.Error(), "checking LokiStack CRD") {
+		t.Errorf("error should name the CRD check, got %v", err)
+	}
+
+	// Status is patched on the error path, so the stale True must still be
+	// replaced before the abort — otherwise Ready keeps reporting a healthy
+	// stack on the strength of a check that never ran.
+	c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable)
+	if c.Status != metav1.ConditionUnknown || c.Reason != lokiCRDCheckFailedReason {
+		t.Errorf("UsageLogsLokiStackAvailable: expected Unknown/%s, got %s/%s",
+			lokiCRDCheckFailedReason, c.Status, c.Reason)
+	}
+
+	// The abort is a real abort: usage logs comes first in lokiComponents, so
+	// returning its error means the log forwarding action never ran and left
+	// no condition behind. Everything downstream — Deploy, the sweep,
+	// publishLokiEndpoints — is skipped on the same return.
+	if c := findCondition(m, conditions.ConditionLokiStackAvailable); c != nil {
+		t.Errorf("LokiStackAvailable: the round should have aborted first, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// TestReconcile_LokiReadinessFailureAbortsBeforeGarbageCollection covers the
+// stack actions' other error return, which this round deliberately changed.
+//
+// It used to be held to the end of the reconcile. It is not any more: a deploy
+// action is a deploy action, and the first one to fail aborts the round the
+// same way the ten ahead of it do. The cost is a lost round when a readiness
+// Get blips; the gain is that no deploy action needs a garbage collection
+// shield, because an abort reaches neither Deploy nor collectGarbage.
+//
+// The condition still has to be written. Reconcile patches status on the error
+// path, so the stale True from the previous round must be replaced before the
+// abort — this is the whole difference between these two error returns and the
+// ten other hasCRD sites, which abort silently.
+func TestReconcile_LokiReadinessFailureAbortsBeforeGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	s, m, objects := lokiReconcileFixture(t)
+
+	// Separate buckets, so the gate passes and the only failure is the Get.
+	objects = append(objects,
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "usage-logs-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "logs-bucket"),
+	)
+	objects = append(objects, liveLokiStacks(m.Spec.Namespace)...)
+
+	// Switched off once the reconcile is done, so the survival assertions
+	// below read the cluster rather than the fault being injected into it.
+	timingOut := true
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+				obj client.Object, opts ...client.GetOption) error {
+				if timingOut && obj.GetObjectKind().GroupVersionKind().Kind == controllergvk.LokiStack.Kind &&
+					key.Name == usageLogsLokiStackResourceName {
+					return k8serr.NewTimeoutError("request timed out", 1)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	r := newTestReconciler(t, s, cli)
+
+	// Up as of the previous round, so the condition below is an invalidation.
+	m.Status.Conditions = nil
+	conditions.NewConditionsManager(m, m.Generation).
+		MarkTrue(conditions.ConditionUsageLogsLokiStackAvailable)
+
+	_, err := r.reconcile(ctx, m)
+	timingOut = false
+	if err == nil {
+		t.Fatal("expected the timed-out readiness check to abort the reconcile")
+	}
+	if !strings.Contains(err.Error(), "checking usage logs LokiStack readiness") {
+		t.Errorf("error should name the readiness check, got %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable)
+	if c.Status != metav1.ConditionUnknown || c.Reason != lokiReadinessCheckFailedReason {
+		t.Errorf("UsageLogsLokiStackAvailable: expected Unknown/%s, got %s/%s",
+			lokiReadinessCheckFailedReason, c.Status, c.Reason)
+	}
+
+	// Nothing was swept. The log forwarding stack is still configured and its
+	// action never ran, so its resources are absent from the desired set —
+	// which is exactly the state a sweep would read as a deletion.
+	for _, name := range []string{usageLogsLokiStackResourceName, lokiStackResourceName} {
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(controllergvk.LokiStack)
+		if err := cli.Get(ctx, types.NamespacedName{Namespace: m.Spec.Namespace, Name: name}, live); err != nil {
+			t.Errorf("LokiStack %s must survive an aborted round: %v", name, err)
+		}
 	}
 }
 
@@ -843,6 +2359,185 @@ func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, na
 		Controller: &controller,
 	}})
 	return obj
+}
+
+// TestPublishLokiEndpoints is the status contract for the two LokiStacks: an
+// endpoint is published only while its own stack reports ready, cleared when
+// the stack is confirmed not ready so nothing dials an address the stack behind
+// it has outlived, and held when readiness could not be observed at all.
+//
+// That last case is the one with teeth. Clearing UsageLogsEndpoint makes the
+// collector half of the usage logs pipeline action return early, so on a clean
+// round garbage collection removes the collector and its policies — a
+// response far too destructive for one failed API call. Unknown therefore
+// keeps the previous value.
+//
+// The storage gate's shield is no substitute for this hold: it covers the
+// pipeline only while its component is withheld, while an unobservable stack
+// on a clean round is exactly the case the endpoint hold has to carry alone.
+//
+// The table deliberately crosses each pipeline's configuration with the other
+// pipeline's readiness. The two stacks are independent and each reads its own
+// condition, so the failure worth catching is one of them answering for the
+// other — which a table that only ever moves both together cannot see.
+func TestPublishLokiEndpoints(t *testing.T) {
+	t.Parallel()
+
+	const (
+		usageLogsEndpoint = "http://data-science-usage-logs-lokistack-gateway-http.test-ns.svc:8080/otlp"
+		logsEndpoint      = "https://data-science-lokistack-gateway-http.test-ns.svc:8080"
+
+		// Values from an earlier round where both stacks were up. Every case
+		// that does not publish has to overwrite these, not skip them.
+		staleUsageLogs = "http://stale-usage-logs"
+		staleLogs      = "http://stale-logs"
+	)
+	data := map[string]any{
+		"UsageLogsEndpoint": usageLogsEndpoint,
+		"LokiQueryEndpoint": logsEndpoint,
+	}
+
+	for _, test := range []struct {
+		name                string
+		usageLogsConfigured bool
+		logsConfigured      bool
+		usageLogsStatus     metav1.ConditionStatus
+		logsStatus          metav1.ConditionStatus
+		// firstReconcile starts from empty endpoints rather than the stale
+		// pair, so "hold what you had" can be told apart from "hold a value".
+		firstReconcile bool
+		wantUsageLogs  string
+		wantLogs       string
+		wantRequeue    bool
+	}{
+		{
+			name: "neither configured clears both",
+			// Readiness is true for both: a condition left over from a
+			// configuration the user has since removed must not publish.
+			usageLogsStatus: metav1.ConditionTrue,
+			logsStatus:      metav1.ConditionTrue,
+		},
+		{
+			name:                "both configured and ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantUsageLogs: usageLogsEndpoint, wantLogs: logsEndpoint,
+		},
+		{
+			name:                "both configured, only usage logs ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionFalse,
+			wantUsageLogs: usageLogsEndpoint,
+			wantRequeue:   true,
+		},
+		{
+			name:                "both configured, only logs ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionFalse, logsStatus: metav1.ConditionTrue,
+			wantLogs:    logsEndpoint,
+			wantRequeue: true,
+		},
+		{
+			name:                "both configured, neither ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionFalse, logsStatus: metav1.ConditionFalse,
+			wantRequeue: true,
+		},
+		{
+			name:            "only logs configured, its stack ready",
+			logsConfigured:  true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantLogs: logsEndpoint,
+		},
+		{
+			name:                "only usage logs configured, its stack ready",
+			usageLogsConfigured: true,
+			usageLogsStatus:     metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantUsageLogs: usageLogsEndpoint,
+		},
+		{
+			// The readiness check failed. Nothing is known about either stack,
+			// so both keep the endpoint they were last published with.
+			name:                "unobservable readiness holds published endpoints",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionUnknown,
+			wantUsageLogs: staleUsageLogs, wantLogs: staleLogs,
+			wantRequeue: true,
+		},
+		{
+			// Holding on Unknown must not invent an endpoint: a stack that has
+			// never been ready has nothing to hold.
+			name:                "unobservable readiness on first reconcile stays empty",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionUnknown,
+			firstReconcile: true,
+			wantRequeue:    true,
+		},
+		{
+			// One stack unobservable, the other confirmed down. Hold and clear
+			// have to be decided per stack, not once for both.
+			name:                "unobservable usage logs holds while confirmed-down logs clears",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionFalse,
+			wantUsageLogs: staleUsageLogs,
+			wantRequeue:   true,
+		},
+		{
+			// Unknown does not override the user turning the feature off.
+			// Whatever the stack is doing, nothing should be dialling it.
+			name:            "unobservable but unconfigured still clears",
+			logsConfigured:  true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionTrue,
+			wantLogs: logsEndpoint,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			if test.usageLogsConfigured {
+				m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{
+					Type: v1alpha1.StorageBackendS3, SecretName: "usage-logs-secret",
+				}}
+			}
+			if test.logsConfigured {
+				m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{
+					Type: v1alpha1.StorageBackendS3, SecretName: "logs-secret",
+				}}
+			}
+
+			if !test.firstReconcile {
+				m.Status.UsageLogsEndpoint = staleUsageLogs
+				m.Status.LogsEndpoint = staleLogs
+			}
+
+			cm := conditions.NewConditionsManager(m, m.Generation)
+			mark := func(condType string, status metav1.ConditionStatus) {
+				switch status {
+				case metav1.ConditionTrue:
+					cm.MarkTrue(condType)
+				case metav1.ConditionFalse:
+					cm.MarkFalse(condType, "LokiStackNotReady", "LokiStack is not ready yet")
+				case metav1.ConditionUnknown:
+					cm.MarkUnknown(condType, "ReadinessCheckFailed", "Cannot determine whether the LokiStack is ready")
+				}
+			}
+			mark(conditions.ConditionUsageLogsLokiStackAvailable, test.usageLogsStatus)
+			mark(conditions.ConditionLokiStackAvailable, test.logsStatus)
+
+			gotRequeue := publishLokiEndpoints(m, data)
+
+			if got := m.Status.UsageLogsEndpoint; got != test.wantUsageLogs {
+				t.Errorf("UsageLogsEndpoint: want %q, got %q", test.wantUsageLogs, got)
+			}
+			if got := m.Status.LogsEndpoint; got != test.wantLogs {
+				t.Errorf("LogsEndpoint: want %q, got %q", test.wantLogs, got)
+			}
+			if gotRequeue != test.wantRequeue {
+				t.Errorf("requeue: want %t, got %t", test.wantRequeue, gotRequeue)
+			}
+		})
+	}
 }
 
 func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testing.T) {
@@ -920,7 +2615,8 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Generation = 7
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {

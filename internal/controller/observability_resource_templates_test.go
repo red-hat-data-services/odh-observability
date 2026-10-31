@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -204,6 +205,7 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"name: \"namespace\"",
 		"apiGroup: metrics.k8s.io",
 		"resource: pods",
+		"verb: get",
 		"namespace: \"{{ .Value }}\"",
 	} {
 		if !strings.Contains(config, expected) {
@@ -219,25 +221,34 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("Thanos proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("Thanos proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 	)
-	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
+	promLabelProxy := findContainer(t, containers, "prom-label-proxy")
+	assertContainerArgs(t, promLabelProxy,
 		"--insecure-listen-address=127.0.0.1:9091",
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
+		"--query-param=namespace",
+		"--error-on-replace",
 		"--enable-label-apis",
-		"--regex-match",
 	)
-
+	assertContainerArgAbsent(t, promLabelProxy, "--regex-match")
+	assertContainerArgs(t, findContainer(t, containers, "method-gate"),
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+		"--allow-form-post",
+	)
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
 	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
@@ -254,13 +265,14 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy NetworkPolicy must select the proxy pods: found=%t value=%q error=%v", found, selector, err)
 	}
 	ingress := nestedSlice(t, policy, "spec", "ingress")
-	if len(ingress) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress rule, got %d", len(ingress))
+	if len(ingress) != 2 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have gateway and Perses ingress rules, got %d", len(ingress))
 	}
-	ingressRule := asMap(t, ingress[0])
-	fromValues, ok := ingressRule["from"].([]any)
+
+	gatewayRule := asMap(t, ingress[0])
+	fromValues, ok := gatewayRule["from"].([]any)
 	if !ok || len(fromValues) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress source, got %#v", ingressRule["from"])
+		t.Fatalf("Thanos proxy NetworkPolicy gateway rule must have one ingress source, got %#v", gatewayRule["from"])
 	}
 	from := asMap(t, fromValues[0])
 	namespaceSelector := asMap(t, from["namespaceSelector"])
@@ -268,13 +280,33 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
 		t.Fatalf("Thanos proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
 	}
-	portValues, ok := ingressRule["ports"].([]any)
+	portValues, ok := gatewayRule["ports"].([]any)
 	if !ok || len(portValues) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one port, got %#v", ingressRule["ports"])
+		t.Fatalf("Thanos proxy NetworkPolicy gateway rule must have one port, got %#v", gatewayRule["ports"])
 	}
 	ports := asMap(t, portValues[0])
 	if ports["protocol"] != "TCP" || ports["port"] != int64(8443) {
 		t.Fatalf("Thanos proxy NetworkPolicy must allow router HTTPS ingress: %#v", ports)
+	}
+
+	persesRule := asMap(t, ingress[1])
+	persesFrom, ok := persesRule["from"].([]any)
+	if !ok || len(persesFrom) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy Perses rule must have one ingress source, got %#v", persesRule["from"])
+	}
+	persesPeer := asMap(t, persesFrom[0])
+	persesSelector := asMap(t, persesPeer["podSelector"])
+	persesLabels, found, err := unstructured.NestedStringMap(persesSelector, "matchLabels")
+	wantPerses := map[string]string{
+		"instance":               "data-science-perses",
+		"app.kubernetes.io/name": "data-science-perses",
+	}
+	if err != nil || !found || !reflect.DeepEqual(persesLabels, wantPerses) {
+		t.Fatalf("Thanos proxy NetworkPolicy must allow Perses pods: got %#v, error=%v", persesLabels, err)
+	}
+	persesPorts, ok := persesRule["ports"].([]any)
+	if !ok || len(persesPorts) != 1 || asMap(t, persesPorts[0])["port"] != int64(8443) {
+		t.Fatalf("Thanos proxy NetworkPolicy Perses rule must allow HTTPS 8443: %#v", persesRule["ports"])
 	}
 }
 
@@ -315,8 +347,8 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 
 	peers, ok := rule["from"].([]any)
-	if !ok || len(peers) != 4 {
-		t.Fatalf("Thanos Querier NetworkPolicy must allow only four internal sources, got %#v", rule["from"])
+	if !ok || len(peers) != 3 {
+		t.Fatalf("Thanos Querier NetworkPolicy must allow only three internal sources (no Perses bypass), got %#v", rule["from"])
 	}
 	prometheusPolicy := findRenderedResource(t,
 		renderObservabilityTemplate(t, PrometheusNetworkPolicyTemplate, map[string]any{"Namespace": testMonitoringNamespace}),
@@ -328,7 +360,6 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 	wantSources := []map[string]string{
 		prometheusSelector,
-		{"instance": "data-science-perses", "app.kubernetes.io/name": "data-science-perses"},
 		{"app": "data-science-thanos-querier-proxy"},
 		{"app.kubernetes.io/name": "korrel8r", "app.kubernetes.io/component": "correlation", "app.kubernetes.io/part-of": "monitoring"},
 	}
@@ -494,6 +525,184 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	ingress := nestedSlice(t, policy, "spec", "ingress")
 	if len(ingress) != 0 {
 		t.Fatalf("Korrel8r NetworkPolicy must deny ingress because no stable in-cluster caller exists, got %#v", ingress)
+	}
+}
+
+// TestLokiStackTemplatesRenderIndependentStorage renders both LokiStack
+// templates from one data map and checks each CR picks up only its own storage.
+//
+// The two templates are identical apart from the key prefix they read
+// (.LokiStorage* versus .UsageLogsLokiStorage*), so a single mis-prefixed key
+// would point one stack at the other's bucket without failing to render. Every
+// value below differs between the two families so that such a swap shows up by
+// name.
+func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace": testMonitoringNamespace,
+
+		"LokiStackName":             lokiStackResourceName,
+		"LokiStorageSecretName":     "logs-secret",
+		"LokiStorageType":           "s3",
+		"LokiStorageCredentialMode": "static",
+		"LokiStorageClassName":      "logs-sc",
+		"LogsLokiStackSize":         "1x.small",
+
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
+	}
+
+	tests := []struct {
+		template        string
+		stackName       string
+		secretName      string
+		credentialMode  string
+		storageClass    string
+		storageTypeName string
+		size            string
+	}{
+		{
+			template:        LokiStackTemplate,
+			stackName:       lokiStackResourceName,
+			secretName:      "logs-secret",
+			credentialMode:  "static",
+			storageClass:    "logs-sc",
+			storageTypeName: "s3",
+			size:            "1x.small",
+		},
+		{
+			template:        UsageLogsLokiStackTemplate,
+			stackName:       usageLogsLokiStackResourceName,
+			secretName:      "usage-logs-secret",
+			credentialMode:  "token",
+			storageClass:    "usage-logs-sc",
+			storageTypeName: "s3",
+			size:            "1x.demo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stackName, func(t *testing.T) {
+			t.Parallel()
+
+			resources := renderObservabilityTemplate(t, tt.template, data)
+			stack := findRenderedResource(t, resources, "LokiStack", tt.stackName)
+
+			for _, field := range []struct {
+				path []string
+				want string
+			}{
+				{[]string{"spec", "storage", "secret", "name"}, tt.secretName},
+				{[]string{"spec", "storage", "secret", "type"}, tt.storageTypeName},
+				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
+				{[]string{"spec", "storageClassName"}, tt.storageClass},
+				{[]string{"spec", "size"}, tt.size},
+				// Both stacks serve the same tenant, which is why they cannot
+				// share a bucket; checkStorageIsolation depends on it.
+				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
+			} {
+				got, found, err := unstructured.NestedString(stack.Object, field.path...)
+				if err != nil || !found || got != field.want {
+					t.Errorf("%s %s: want %q, got %q (found=%t error=%v)",
+						tt.stackName, strings.Join(field.path, "."), field.want, got, found, err)
+				}
+			}
+
+			if namespace := stack.GetNamespace(); namespace != testMonitoringNamespace {
+				t.Errorf("%s: want namespace %q, got %q", tt.stackName, testMonitoringNamespace, namespace)
+			}
+		})
+	}
+}
+
+// TestLokiStackTemplatesCarryComponentLabel is the drift guard for the garbage
+// collection shield. A rejected storage configuration renders none of these
+// templates, so the only thing keeping the live resources out of the
+// collector's reach is this label on the objects already in the cluster. A
+// template added to a stack action without it would be deleted the first time
+// the storage check fails, which is exactly the data loss the shield prevents.
+//
+// Which value it carries is as much the contract as that it carries one. The
+// two stacks are shielded independently, so a usage logs template labelled for
+// log forwarding would be spared by the wrong claimant's failure and collected
+// on its own.
+func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace":                          testMonitoringNamespace,
+		"LokiStackName":                      lokiStackResourceName,
+		"LokiStorageSecretName":              "logs-secret",
+		"LokiStorageType":                    "s3",
+		"LokiStorageCredentialMode":          "static",
+		"LokiStorageClassName":               "logs-sc",
+		"LogsLokiStackSize":                  "1x.extra-small",
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
+		"Korrel8rName":                       Korrel8rServiceName,
+		// The usage logs gateway policy names the collector as its only peer.
+		"UsageLogsCollectorName":               "data-science-usage-logs",
+		"UsageLogs":                            true,
+		"UsageLogsEndpoint":                    "https://usage-logs.example.com/otlp",
+		"UsageLogsCredentialSecret":            "",
+		"UsageLogsExporterNames":               []string{},
+		"UsageLogsAttributeNames":              []string{},
+		"CollectorReplicas":                    1,
+		"CollectorCPURequest":                  "100m",
+		"CollectorCPULimit":                    "500m",
+		"CollectorMemoryRequest":               "128Mi",
+		"CollectorMemoryLimit":                 "256Mi",
+		"ClusterLogForwarderName":              "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderServiceAccount":    "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderNetworkPolicyName": ClusterLogForwarderNetworkPolicyName,
+		"ClusterLoggingNamespace":              "openshift-logging",
+		"KubernetesAPIServerCIDRs":             []string{"172.20.0.1/32"},
+		"InferenceNamespaces":                  []string{"redhat-ods-applications"},
+	}
+
+	// Must stay in step with the two pipeline actions' templates in
+	// actions.go, grouped the same way they are grouped there. The dependents
+	// carry the same component label as their stack because the storage gate
+	// withholds the pipeline as one unit: an unlabelled collector or
+	// forwarder dropped from the desired set would read to the sweep as a
+	// deletion.
+	for template, wantComponent := range map[string]string{
+		UsageLogsLokiStackTemplate:                  componentLokiUsageLogs,
+		UsageLogsLokiStackNPTemplate:                componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorTemplate:     componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorRBACTemplate: componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorNPTemplate:   componentLokiUsageLogs,
+		LokiStackTemplate:                           componentLokiLogs,
+		LokiStackNetworkPolicyTemplate:              componentLokiLogs,
+		LokiStackGatewayNetworkPolicyTemplate:       componentLokiLogs,
+		ClusterLogForwarderTemplate:                 componentLokiLogs,
+		ClusterLogForwarderRBACTemplate:             componentLokiLogs,
+		ClusterLogForwarderNetworkPolicyTemplate:    componentLokiLogs,
+	} {
+		t.Run(template, func(t *testing.T) {
+			t.Parallel()
+
+			// Only the component label is asserted here. part-of is the other
+			// half of the shield — it is the selector the collector lists by
+			// — but it is not a template contract: the deployer stamps it
+			// from the field owner for any object that arrives without one,
+			// which is why most operand CR templates omit it.
+			for _, resource := range renderObservabilityTemplate(t, template, data) {
+				if got := resource.GetLabels()[componentLabel]; got != wantComponent {
+					t.Errorf("%s %s: want %s=%s, got %q",
+						resource.GetKind(), resource.GetName(), componentLabel, wantComponent, got)
+				}
+			}
+		})
 	}
 }
 
@@ -676,6 +885,11 @@ func TestPersesTemplateContract(t *testing.T) {
 	if err != nil || !found || !reflect.DeepEqual(labels, wantLabels) {
 		t.Fatalf("Perses pod labels must match the access NetworkPolicy selector: got %#v, error=%v", labels, err)
 	}
+	if _, found, err := unstructured.NestedMap(perses.Object, "spec", "config", "security"); err != nil {
+		t.Fatalf("reading Perses security config: %v", err)
+	} else if found {
+		t.Fatal("Perses must leave security/auth disabled; metrics tenancy is enforced by the Thanos proxy")
+	}
 }
 
 func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
@@ -695,24 +909,12 @@ func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
-	clusterRole := findRenderedResource(t, resources, "ClusterRole", "data-science-metrics-view")
-	if labels := clusterRole.GetLabels(); len(labels) != 4 || labels["rbac.authorization.k8s.io/aggregate-to-view"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-edit"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-admin"] != "true" ||
-		labels["platform.opendatahub.io/part-of"] != "monitoring" {
-		t.Fatalf("metrics ClusterRole must aggregate to view/edit/admin: %#v", labels)
+	// The template must not aggregate extra metrics permissions into view/edit/admin.
+	for _, resource := range resources {
+		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
+			t.Fatal("namespace proxy must not aggregate extra permissions into view/edit/admin")
+		}
 	}
-	rules := nestedSlice(t, clusterRole, "rules")
-	if len(rules) != 1 {
-		t.Fatalf("expected one metrics ClusterRole rule, got %d", len(rules))
-	}
-	rule := asMap(t, rules[0])
-	if len(rule) != 3 {
-		t.Fatalf("metrics ClusterRole rule must not contain extra permissions: %#v", rule)
-	}
-	assertStringSet(t, rule, "apiGroups", []string{"metrics.k8s.io"})
-	assertStringSet(t, rule, "resources", []string{"pods"})
-	assertStringSet(t, rule, "verbs", []string{"create"})
 
 	assertClusterRoleBinding(
 		t,
@@ -739,6 +941,7 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"name: \"namespace\"",
 		"apiGroup: metrics.k8s.io",
 		"resource: pods",
+		"verb: get",
 		"namespace: \"{{ .Value }}\"",
 	} {
 		if !strings.Contains(config, expected) {
@@ -754,16 +957,20 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		t.Fatalf("namespace proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("namespace proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("namespace proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
+	// kube-rbac-proxy must forward to the method gate (:9092), not directly to
+	// prom-label-proxy (:9091), so GET/HEAD enforcement runs before label proxying.
 	assertContainerArgs(t, asMap(t, containers[0]),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 	)
 	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
 		"--insecure-listen-address=127.0.0.1:9091",
@@ -772,6 +979,34 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
+
+	// The method gate must be present (findContainer fails the test otherwise) and
+	// run the operator binary's "method-gate" subcommand, listening on :9092 and
+	// forwarding to prom-label-proxy on :9091. GET/HEAD enforcement is implemented
+	// in that subcommand, independent of RBAC.
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("method-gate command has unexpected type %T", gate["command"])
+	}
+	gateCommandStrs := make([]string, 0, len(gateCommand))
+	for _, c := range gateCommand {
+		s, ok := c.(string)
+		if !ok {
+			t.Fatalf("method-gate command element has unexpected type %T", c)
+		}
+		gateCommandStrs = append(gateCommandStrs, s)
+	}
+	for _, expected := range []string{
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	} {
+		if !slices.Contains(gateCommandStrs, expected) {
+			t.Errorf("method-gate command must contain %q, got %v", expected, gateCommandStrs)
+		}
+	}
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -803,18 +1038,23 @@ func TestPrometheusClusterProxyTemplateContract(t *testing.T) {
 	if len(containers) != 1 {
 		t.Fatalf("cluster proxy must have one kube-rbac-proxy container, got %d", len(containers))
 	}
-	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
+	proxyContainer := findContainer(t, containers, "kube-rbac-proxy")
+	assertContainerArgs(t, proxyContainer,
 		"--secure-listen-address=0.0.0.0:8443",
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--config-file=/etc/kube-rbac-proxy/config.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 		"--upstream-ca-file=/etc/prometheus-ca/service-ca.crt",
 		"--upstream-client-cert-file=/etc/prometheus-client/tls.crt",
 		"--upstream-client-key-file=/etc/prometheus-client/tls.key",
 		"--allow-paths=/metrics",
 	)
+	assertTCPSocketProbe(t, proxyContainer, "livenessProbe")
+	assertTCPSocketProbe(t, proxyContainer, "readinessProbe")
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-cluster-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -858,20 +1098,24 @@ type persesDatasourceContract struct {
 func TestPersesPrometheusDatasourceTemplateContracts(t *testing.T) {
 	tests := []persesDatasourceContract{
 		{
-			name:         "data science datasource",
-			template:     PersesDatasourcePrometheusTemplate,
-			datasource:   "data-science-prometheus-datasource",
-			url:          "http://thanos-querier-data-science-thanos-querier." + testMonitoringNamespace + ".svc.cluster.local:10902",
-			defaultValue: false,
+			name:          "data science datasource",
+			template:      PersesDatasourcePrometheusTemplate,
+			datasource:    "data-science-prometheus-datasource",
+			secret:        "data-science-prometheus-datasource-secret",
+			url:           "https://data-science-thanos-querier-proxy." + testMonitoringNamespace + ".svc.cluster.local:8443",
+			defaultValue:  true,
+			expectTLS:     true,
+			queryParamKey: "namespace",
 		},
 		{
-			name:         "cluster datasource",
-			template:     PersesDatasourceClusterPrometheusTemplate,
-			datasource:   "cluster-prometheus-datasource",
-			secret:       "cluster-prometheus-datasource-secret",
-			url:          "https://thanos-querier.openshift-monitoring.svc:9091",
-			defaultValue: true,
-			expectTLS:    true,
+			name:          "cluster prometheus datasource",
+			template:      PersesDatasourceClusterPrometheusTemplate,
+			datasource:    "cluster-prometheus-datasource",
+			secret:        "cluster-prometheus-datasource-secret",
+			url:           "https://thanos-querier.openshift-monitoring.svc:9091",
+			defaultValue:  false,
+			expectTLS:     true,
+			queryParamKey: "",
 		},
 		{
 			name:          "cluster tenancy datasource",
@@ -1010,7 +1254,32 @@ func assertPersesDatasourceTLS(t *testing.T, datasource unstructured.Unstructure
 
 func assertPersesDatasourceSecret(t *testing.T, resources []unstructured.Unstructured, datasource unstructured.Unstructured, contract persesDatasourceContract) {
 	t.Helper()
+	secretReference, found, err := unstructured.NestedString(datasource.Object, "spec", "config", "plugin", "spec", "proxy", "spec", "secret")
+	if err != nil {
+		t.Fatalf("reading datasource proxy secret reference: %v", err)
+	}
 	if contract.secret == "" {
+		if found {
+			t.Fatalf("datasource must not use a shared proxy secret (caller token is forwarded), got %q", secretReference)
+		}
+		for _, resource := range resources {
+			if resource.GetKind() == "Secret" {
+				t.Fatalf("caller-token datasources must not render a shared Secret, found %q", resource.GetName())
+			}
+		}
+		return
+	}
+	if !found || secretReference != contract.secret {
+		t.Fatalf("datasource must reference Secret %q: found=%t value=%q", contract.secret, found, secretReference)
+	}
+	// TLS CA secrets are created by the Perses operator from client.tls — our
+	// templates must only reference them (same pattern as tempo-datasource).
+	if contract.expectTLS {
+		for _, resource := range resources {
+			if resource.GetKind() == "Secret" {
+				t.Fatalf("TLS datasource must not render a Secret (Perses operator creates %q from client.tls), found %q", contract.secret, resource.GetName())
+			}
+		}
 		return
 	}
 	secret := findRenderedResource(t, resources, "Secret", contract.secret)
@@ -1026,10 +1295,6 @@ func assertPersesDatasourceSecret(t *testing.T, resources []unstructured.Unstruc
 	serviceAccount, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "kubernetes.io/service-account.name")
 	if err != nil || !found || serviceAccount != "data-science-prometheus-cluster-proxy" {
 		t.Fatalf("datasource Secret must reference the cluster proxy service account: found=%t value=%q error=%v", found, serviceAccount, err)
-	}
-	secretReference, found, err := unstructured.NestedString(datasource.Object, "spec", "config", "plugin", "spec", "proxy", "spec", "secret")
-	if err != nil || !found || secretReference != contract.secret {
-		t.Fatalf("datasource must reference Secret %q: found=%t value=%q error=%v", contract.secret, found, secretReference, err)
 	}
 }
 
@@ -1059,8 +1324,40 @@ func proxyTemplateData() map[string]any {
 		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
-		"TLSMinVersion":       "VersionTLS12",
-		"TLSCipherSuites":     "",
+		"HTTPMethodGateImage": "example.invalid/method-gate:test",
+		"TLSMinVersion":       proxyTLSVersion12,
+		"TLSCipherSuites":     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLSCurvePreferences": "29,25",
+	}
+}
+
+func TestProxyTemplatesTLS13OmitCipherRestriction(t *testing.T) {
+	proxyTemplates := []struct {
+		template       string
+		deploymentName string
+	}{
+		{template: PrometheusNamespaceProxyTemplate, deploymentName: "data-science-prometheus-namespace-proxy"},
+		{template: PrometheusClusterProxyTemplate, deploymentName: "data-science-prometheus-cluster-proxy"},
+		{template: ThanosQuerierProxyTemplate, deploymentName: "data-science-thanos-querier-proxy"},
+	}
+
+	for _, proxy := range proxyTemplates {
+		t.Run(proxy.deploymentName, func(t *testing.T) {
+			data := proxyTemplateData()
+			data["TLSMinVersion"] = proxyTLSVersion13
+			data["TLSCipherSuites"] = ""
+			data["TLSCurvePreferences"] = "23,29"
+
+			resources := renderObservabilityTemplate(t, proxy.template, data)
+			deployment := findRenderedResource(t, resources, "Deployment", proxy.deploymentName)
+			containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
+			container := findContainer(t, containers, "kube-rbac-proxy")
+			assertContainerArgs(t, container,
+				"--tls-min-version="+proxyTLSVersion13,
+				"--tls-curve-preferences=23,29",
+			)
+			assertContainerArgAbsent(t, container, "--tls-cipher-suites=")
+		})
 	}
 }
 
@@ -1129,30 +1426,6 @@ func asMap(t *testing.T, value any) map[string]any {
 	return result
 }
 
-func assertStringSet(t *testing.T, object map[string]any, field string, want []string) {
-	t.Helper()
-	got, found, err := unstructured.NestedStringSlice(object, field)
-	if err != nil || !found {
-		t.Fatalf("field %q is missing: found=%t error=%v", field, found, err)
-	}
-	wantSet := make(map[string]struct{}, len(want))
-	for _, value := range want {
-		wantSet[value] = struct{}{}
-	}
-	gotSet := make(map[string]struct{}, len(got))
-	for _, value := range got {
-		gotSet[value] = struct{}{}
-	}
-	if len(got) != len(gotSet) || len(gotSet) != len(wantSet) {
-		t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-	}
-	for value := range wantSet {
-		if _, found := gotSet[value]; !found {
-			t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-		}
-	}
-}
-
 func assertClusterRoleBinding(t *testing.T, binding unstructured.Unstructured, roleName, subjectName, subjectNamespace string) {
 	t.Helper()
 	roleRef, found, err := unstructured.NestedMap(binding.Object, "roleRef")
@@ -1195,5 +1468,28 @@ func assertContainerArgs(t *testing.T, container map[string]any, expected ...str
 		if !containsString(args, want) {
 			t.Errorf("container %q args do not contain %q: %#v", container["name"], want, args)
 		}
+	}
+}
+
+func assertContainerArgAbsent(t *testing.T, container map[string]any, unexpected string) {
+	t.Helper()
+	args, ok := container["args"].([]any)
+	if !ok {
+		t.Fatalf("container %q args have unexpected type %T", container["name"], container["args"])
+	}
+	if containsString(args, unexpected) {
+		t.Errorf("container %q args must not contain %q: %#v", container["name"], unexpected, args)
+	}
+}
+
+func assertTCPSocketProbe(t *testing.T, container map[string]any, probeName string) {
+	t.Helper()
+	probe, ok := container[probeName].(map[string]any)
+	if !ok {
+		t.Fatalf("container %q is missing %s", container["name"], probeName)
+	}
+	tcpSocket, ok := probe["tcpSocket"].(map[string]any)
+	if !ok || tcpSocket["port"] != int64(8443) {
+		t.Fatalf("container %q %s must probe TCP port 8443, got: %#v", container["name"], probeName, probe)
 	}
 }

@@ -2,7 +2,14 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +18,9 @@ import (
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,30 +37,35 @@ import (
 
 // Constants for monitoring resource names.
 const (
-	MonitoringStackName                  = "data-science-monitoringstack"
-	OpenTelemetryCollectorName           = "data-science-collector"
-	TargetAllocatorDeploymentName        = "data-science-collector-targetallocator"
-	TargetAllocatorCACertificateName     = OpenTelemetryCollectorName + "-ca-cert"
-	TargetAllocatorClientCertificateName = OpenTelemetryCollectorName + "-ta-client-cert"
-	TargetAllocatorServerCertificateName = OpenTelemetryCollectorName + "-ta-server-cert"
-	CollectorServiceAccount              = "data-science-collector-collector"
-	TargetAllocatorServiceAccount        = "data-science-collector-targetallocator"
-	TempoMonolithicName                  = "data-science-tempomonolithic"
-	TempoStackName                       = "data-science-tempostack"
-	InstrumentationName                  = "data-science-instrumentation"
-	ThanosQuerierName                    = "data-science-thanos-querier"
-	ThanosQuerierRouteName               = "data-science-thanos-querier-route"
-	ThanosQuerierProxyName               = "data-science-thanos-querier-proxy"
-	PersesName                           = "data-science-perses"
-	PersesDatasourceName                 = "data-science-prometheus-datasource"
-	ClusterPrometheusDatasourceName      = "cluster-prometheus-datasource"
-	ClusterPrometheusDatasourceSecret    = "cluster-prometheus-datasource-secret"
-	UsageLogsCollectorName               = "data-science-usage-logs"
-	UsageLogsCollectorServiceAccount     = "data-science-usage-logs-collector"
-	LokiStackName                        = "data-science-lokistack"
+	MonitoringStackName                    = "data-science-monitoringstack"
+	OpenTelemetryCollectorName             = "data-science-collector"
+	OpenTelemetryCollectorServiceName      = OpenTelemetryCollectorName + "-collector"
+	TargetAllocatorDeploymentName          = "data-science-collector-targetallocator"
+	TargetAllocatorCACertificateName       = OpenTelemetryCollectorName + "-ca-cert"
+	TargetAllocatorClientCertificateName   = OpenTelemetryCollectorName + "-ta-client-cert"
+	TargetAllocatorServerCertificateName   = OpenTelemetryCollectorName + "-ta-server-cert"
+	CollectorServiceAccount                = "data-science-collector-collector"
+	TargetAllocatorServiceAccount          = "data-science-collector-targetallocator"
+	TempoMonolithicName                    = "data-science-tempomonolithic"
+	TempoStackName                         = "data-science-tempostack"
+	InstrumentationName                    = "data-science-instrumentation"
+	ThanosQuerierName                      = "data-science-thanos-querier"
+	ThanosQuerierRouteName                 = "data-science-thanos-querier-route"
+	ThanosQuerierProxyName                 = "data-science-thanos-querier-proxy"
+	PersesName                             = "data-science-perses"
+	PersesDatasourceName                   = "data-science-prometheus-datasource"
+	ClusterPrometheusDatasourceName        = "cluster-prometheus-datasource"
+	ClusterPrometheusTenancyDatasourceName = "cluster-prometheus-tenancy-datasource"
+	ClusterPrometheusDatasourceSecret      = "cluster-prometheus-datasource-secret"
+	UsageLogsCollectorName                 = "data-science-usage-logs"
+	UsageLogsCollectorServiceAccount       = "data-science-usage-logs-collector"
+	LokiStackName                          = "data-science-lokistack"
+	UsageLogsLokiStackName                 = "data-science-usage-logs-lokistack"
 
 	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
-	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
+	UsageLogsLokiStackNetworkPolicyName = UsageLogsLokiStackName + "-allow"
+	LokiStackNetworkPolicyName          = LokiStackName + "-ingress"
+	LokiStackGatewayNetworkPolicyName   = LokiStackName + "-gateway-ingress"
 )
 
 func cooOperatorChannel() string {
@@ -95,6 +109,11 @@ const (
 	lokiOpName      = "loki-operator"
 	lokiOpNamespace = "openshift-operators-redhat"
 
+	// clusterLoggingOpName is the OLM package of the OpenShift Logging operator.
+	// It installs into clusterLoggingNamespace (monitoring_observability_contract_test.go),
+	// the same namespace the operator applies the ClusterLogForwarder into.
+	clusterLoggingOpName = "cluster-logging"
+
 	// defaultInferenceMonitoringNamespace is the literal spec.monitoring.namespace written in
 	// tests/e2e/prerequisites/inference/dsci.yaml, and defaultInferenceApplicationsNamespace the
 	// literal spec.applicationsNamespace. renderManifest rewrites both to -monitoring-namespace
@@ -106,14 +125,19 @@ const (
 	defaultInferenceMonitoringNamespace   = "redhat-ods-monitoring"
 	defaultInferenceApplicationsNamespace = "redhat-ods-applications"
 
-	// The opendatahub-operator owns the DSCI and DSC and provisions the monitoring module, so
-	// the inference prerequisites cannot make progress until it is Available and serving its
-	// webhook. These are not part of the namespace switch above: which operator is installed is
-	// independent of the namespaces its DSCI points at. An RHOAI install names them
-	// rhods-operator / redhat-ods-operator instead.
-	odhOperatorNamespace      = "opendatahub-operator-system"
-	odhOperatorDeployment     = "opendatahub-operator-controller-manager"
-	odhOperatorWebhookService = "opendatahub-operator-webhook-service"
+	clusterIngressCANamespace = "openshift-config-managed"
+	clusterIngressCAConfigMap = "default-ingress-cert"
+	clusterIngressCAKey       = "ca-bundle.crt"
+
+	// platformOperatorRHOAI and platformOperatorODH name the platform operator Deployment and
+	// webhook Service for inference prerequisite waits. detectPlatformOperator picks whichever
+	// layout is installed.
+	platformOperatorRHOAINamespace      = "redhat-ods-operator"
+	platformOperatorRHOAIDeployment     = "rhods-operator"
+	platformOperatorRHOAIWebhookService = "rhods-operator-service"
+	platformOperatorODHNamespace        = "opendatahub-operator-system"
+	platformOperatorODHDeployment       = "opendatahub-operator-controller-manager"
+	platformOperatorODHWebhookService   = "opendatahub-operator-webhook-service"
 	// lokiStorageType mirrors spec.monitoring.usageLogs.storage.type there.
 	lokiStorageType = "s3"
 	// lokiS3SecretName mirrors spec.monitoring.usageLogs.storage.secretName there. The test-
@@ -153,8 +177,12 @@ const (
 	OtlpCustomExporter     = "otlp/custom"
 	OtlpHttpCustomExporter = "otlphttp/custom"
 	OtlpTempoExporter      = "otlp/tempo"
-	MetricsCPURequest      = "100m"
-	MetricsMemoryRequest   = "256Mi"
+	// Distinct Mode 2 exporter names so metrics+traces combined configs do not collide
+	// in the collector's shared exporters map.
+	OtlpHttpMetricsExternalExporter = "otlphttp/metrics-external"
+	OtlpHttpTracesExternalExporter  = "otlphttp/traces-external"
+	MetricsCPURequest               = "100m"
+	MetricsMemoryRequest            = "256Mi"
 
 	TracesStorageBackendPV  = "pv"
 	TracesStorageBackendS3  = "s3"
@@ -433,12 +461,15 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 			Name: UsageLogsCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
 	)
-	tc.EnsureResourceGone(
-		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name: LokiStackName, Namespace: tc.MonitoringNamespace,
-		}),
-		WithEventuallyTimeout(15*time.Minute),
-	)
+	// Both usageLogs and logs were deleted above, so neither LokiStack remains.
+	for _, name := range []string{UsageLogsLokiStackName, LokiStackName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.LokiStack, types.NamespacedName{
+				Name: name, Namespace: tc.MonitoringNamespace,
+			}),
+			WithEventuallyTimeout(15*time.Minute),
+		)
+	}
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
@@ -565,12 +596,120 @@ func (tc *MonitoringTestCtx) setupUsageLogsWithStorage(t *testing.T, storageType
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
 		withUsageLogsStorage(storageType, secretName, tc.DefaultStorageClass),
+		// Keep the usage stack small enough to coexist with the log-forwarding
+		// stack on the e2e cluster; production retains the default size.
+		jq.Transform(`.spec.usageLogs.size = "1x.demo"`),
+	)
+}
+
+// setupLogsWithStorage creates a secret and configures log forwarding storage,
+// which is what deploys the log forwarding LokiStack. It does not wait for
+// Monitoring to be Ready: the ClusterLogForwarder stays unavailable until its
+// own LokiStack finishes provisioning.
+//
+// The ordering is load-bearing. With both stacks configured, the storage
+// isolation check fails closed until every referenced secret resolves, so
+// patching the CR first would withhold both stacks until the secret arrives
+// and the watch on it fires.
+func (tc *MonitoringTestCtx) setupLogsWithStorage(t *testing.T, storageType, secretName string) {
+	t.Helper()
+	tc.createLokiS3SecretForBucket(t, secretName, tc.MonitoringNamespace, logsS3Bucket)
+	tc.updateMonitoringConfigWithoutReady(
+		withManagementState(common.Managed),
+		withLogsStorage(storageType, secretName, tc.DefaultStorageClass),
+		jq.Transform(`.spec.logs.size = "1x.demo"`),
 	)
 }
 
 // cleanupTracesConfiguration resets traces configuration.
 func (tc *MonitoringTestCtx) cleanupTracesConfiguration() {
 	tc.updateMonitoringConfig(withManagementState(common.Managed), withNoTraces())
+}
+
+// platformOperator identifies the ODH or RHOAI platform operator Deployment and webhook Service.
+type platformOperator struct {
+	Namespace      string
+	Deployment     string
+	WebhookService string
+}
+
+// clusterIngressCAPEM returns the PEM bundle used to verify OpenShift Route certificates.
+func clusterIngressCAPEM(t *testing.T, ctx context.Context, c client.Client) string {
+	t.Helper()
+
+	configMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{
+		Name:      clusterIngressCAConfigMap,
+		Namespace: clusterIngressCANamespace,
+	}, configMap); err != nil {
+		t.Fatalf("failed to read the cluster ingress CA ConfigMap: %v", err)
+	}
+	caBundle := configMap.Data[clusterIngressCAKey]
+	if caBundle == "" {
+		t.Fatalf("cluster ingress CA ConfigMap %q is missing %q", clusterIngressCAConfigMap, clusterIngressCAKey)
+	}
+	return caBundle
+}
+
+// ingressCAPool returns a cert pool for HTTPS clients calling OpenShift Routes (system CAs plus
+// the cluster ingress certificate bundle).
+func ingressCAPool(t *testing.T, ctx context.Context, c client.Client) *x509.CertPool {
+	t.Helper()
+
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		rootCAs = x509.NewCertPool()
+	}
+
+	caBundle := clusterIngressCAPEM(t, ctx, c)
+	if !rootCAs.AppendCertsFromPEM([]byte(caBundle)) {
+		t.Fatalf("cluster ingress CA ConfigMap %q does not contain a valid PEM certificate bundle", clusterIngressCAConfigMap)
+	}
+	return rootCAs
+}
+
+// writeClusterIngressCAFile writes the cluster ingress CA bundle for tools (for example gcx)
+// that read trust via GRAFANA_TLS_CA_FILE.
+func writeClusterIngressCAFile(t *testing.T, ctx context.Context, c client.Client) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "openshift-ingress-ca.pem")
+	if err := os.WriteFile(path, []byte(clusterIngressCAPEM(t, ctx, c)), 0o600); err != nil {
+		t.Fatalf("failed to write cluster ingress CA bundle for OATS/gcx: %v", err)
+	}
+	return path
+}
+
+func detectPlatformOperator(ctx context.Context, c client.Client) (platformOperator, error) {
+	layouts := []platformOperator{
+		{
+			Namespace:      platformOperatorRHOAINamespace,
+			Deployment:     platformOperatorRHOAIDeployment,
+			WebhookService: platformOperatorRHOAIWebhookService,
+		},
+		{
+			Namespace:      platformOperatorODHNamespace,
+			Deployment:     platformOperatorODHDeployment,
+			WebhookService: platformOperatorODHWebhookService,
+		},
+	}
+	for _, layout := range layouts {
+		deployment := &unstructured.Unstructured{}
+		deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+		err := c.Get(ctx, types.NamespacedName{Namespace: layout.Namespace, Name: layout.Deployment}, deployment)
+		if k8serr.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return platformOperator{}, fmt.Errorf("checking platform operator %s/%s: %w", layout.Namespace, layout.Deployment, err)
+		}
+		return layout, nil
+	}
+	return platformOperator{}, fmt.Errorf(
+		"platform operator deployment not found (tried %s/%s and %s/%s)",
+		platformOperatorRHOAINamespace, platformOperatorRHOAIDeployment,
+		platformOperatorODHNamespace, platformOperatorODHDeployment,
+	)
 }
 
 // detectExpectedReplicas queries the cluster node count to determine expected Prometheus replicas.
@@ -689,8 +828,17 @@ func (tc *TestContext) createTempoGCSSecret(t *testing.T, secretName, namespace 
 	)
 }
 
-// createLokiS3Secret creates an S3 secret compatible with LokiStack operator.
+// createLokiS3Secret creates an S3 secret compatible with LokiStack operator,
+// backed by the usage logs bucket.
 func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace string) {
+	t.Helper()
+	tc.createLokiS3SecretForBucket(t, secretName, namespace, lokiS3Bucket)
+}
+
+// createLokiS3SecretForBucket creates a LokiStack S3 secret for a specific
+// bucket. The two LokiStacks use separate buckets, so the bucket is part of the
+// caller's choice rather than fixed.
+func (tc *TestContext) createLokiS3SecretForBucket(t *testing.T, secretName, namespace, bucket string) {
 	t.Helper()
 
 	secret := &corev1.Secret{
@@ -702,7 +850,7 @@ func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace st
 		Data: map[string][]byte{
 			"access_key_id":     []byte(seaweedFSAccessKey),
 			"access_key_secret": []byte(seaweedFSSecretKey),
-			"bucketnames":       []byte(lokiS3Bucket),
+			"bucketnames":       []byte(bucket),
 			"endpoint":          fmt.Appendf(nil, "http://%s.%s.svc.cluster.local:%d", seaweedFSServiceName, namespace, seaweedFSS3Port),
 			"region":            []byte("us-east-1"),
 			"insecure":          []byte("true"),
@@ -820,6 +968,34 @@ func withCustomTracesExporters() jq.TransformFn {
     }`, OtlpHttpCustomExporter)
 }
 
+// withMetricsExportersOnly configures metrics with custom exporters and no built-in storage (Mode 2).
+func withMetricsExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.metrics = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://metrics-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
+}
+
+// withTracesExportersOnly configures traces with custom exporters and no built-in storage (Mode 2).
+func withTracesExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.traces = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://traces-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
+}
+
 func withReservedTracesExporter() jq.TransformFn {
 	return jq.Transform(`.spec.traces.exporters = {
         "%s": {
@@ -911,6 +1087,19 @@ func (tc *MonitoringTestCtx) registerMonitoringRestore(t *testing.T) {
 // is auto-detected from the CR's spec.namespace unless overridden via flag.
 func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	t.Helper()
+	tc.ensurePrerequisitesWithMonitoringReset(t, true)
+}
+
+// ensurePrerequisitesPreservingMonitoring validates the live monitoring stack
+// without rewriting its configuration. Upgrade survivability depends on the
+// same operands remaining available across the operator transition.
+func (tc *MonitoringTestCtx) ensurePrerequisitesPreservingMonitoring(t *testing.T) {
+	t.Helper()
+	tc.ensurePrerequisitesWithMonitoringReset(t, false)
+}
+
+func (tc *MonitoringTestCtx) ensurePrerequisitesWithMonitoringReset(t *testing.T, resetMonitoring bool) {
+	t.Helper()
 
 	operatorMonitoringNamespace := tc.ensureOperatorDeploymentReady(t)
 	if tc.ApiMode == APIModeModule && tc.MonitoringNamespace == "" {
@@ -930,7 +1119,9 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	if tc.ApiMode == APIModeDSC {
 		tc.ensureCRDExists(t, gvk.DSCInitialization)
 	}
-	tc.registerMonitoringRestore(t)
+	if resetMonitoring {
+		tc.registerMonitoringRestore(t)
+	}
 
 	if testOpts.installOperators {
 		tc.installDependentOperators(t)
@@ -942,6 +1133,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		"opentelemetry-operator",
 		certManagerOpPackage,
 		"loki-operator",
+		clusterLoggingOpName,
 	} {
 		if testOpts.installOperators {
 			tc.g.Eventually(func() error {
@@ -960,23 +1152,52 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.OpenTelemetryCollector,
 		gvk.Instrumentation,
 		gvk.LokiStack,
+		gvk.ClusterLogForwarder,
 		gvk.Perses,
 		gvk.ThanosQuerier,
-		gvk.CoreosPodMonitor,
-		gvk.CoreosServiceMonitor,
+		gvk.PodMonitorCoreos,
+		gvk.ServiceMonitorCoreos,
+		gvk.ServiceMonitor,
 	} {
 		tc.ensureCRDExists(t, required)
 	}
 
-	tc.ensureMonitoringCRExists(t)
+	// Operator metrics use monitoring.rhobs/v1 (gvk.ServiceMonitor), which COO
+	// installs. ServiceMonitorCoreos above is the webhook target and a different CRD.
+	// Create the operator ServiceMonitor in Module mode only.
+	if tc.ApiMode == APIModeModule && resetMonitoring {
+		tc.ensureOperatorServiceMonitor(t)
+	}
+
+	if resetMonitoring {
+		tc.ensureMonitoringCRExists(t)
+	} else {
+		if tc.ApiMode == APIModeDSC {
+			tc.EnsureResourceExists(
+				WithMinimalObject(gvk.DSCInitialization, types.NamespacedName{Name: tc.DSCICRName}),
+				WithCustomErrorMsg("upgrade survivability requires an existing DSCI"),
+			)
+		}
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+			WithCustomErrorMsg("upgrade survivability requires an existing Monitoring CR"),
+		)
+	}
 
 	if tc.MonitoringNamespace == "" {
 		tc.MonitoringNamespace = tc.detectMonitoringNamespace(t)
 		t.Logf("auto-detected monitoring namespace: %s", tc.MonitoringNamespace)
 	}
 
-	tc.ensureNamespaceExists(tc.MonitoringNamespace)
-	tc.resetMonitoringConfigToManaged()
+	if resetMonitoring {
+		tc.ensureNamespaceExists(tc.MonitoringNamespace)
+		tc.resetMonitoringConfigToManaged()
+	} else {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: tc.MonitoringNamespace}),
+			WithCustomErrorMsg("active monitoring namespace %s must already exist", tc.MonitoringNamespace),
+		)
+	}
 }
 
 // operatorExists checks the OLM OperatorCondition API version served by the
@@ -1041,6 +1262,8 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
+		// cert-manager is preinstalled by the CI pipeline from a different catalog
+		// source than redhat-operators, so EnsureOperatorInstalled cannot match it.
 	}
 
 	t.Run("install-dependent-operators", func(t *testing.T) {
@@ -1068,6 +1291,7 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 	}
 
 	tc.ensureLokiOperatorInstalled(t)
+	tc.ensureClusterLoggingOperatorInstalled(t)
 }
 
 // ensureOpenTelemetryCertManagerRBAC supplies the certificate permissions
@@ -1164,6 +1388,43 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		t.Fatalf("failed to check LokiStack CRD: %v", err)
 	}
 
+	channel := tc.redhatOperatorsDefaultChannel(t, lokiOpName)
+	t.Logf("installing Loki Operator from redhat-operators channel %s", channel)
+	tc.EnsureOperatorInstalled(lokiOpNamespace, lokiOpName, channel)
+}
+
+// ensureClusterLoggingOperatorInstalled installs the OpenShift Logging operator
+// unless the ClusterLogForwarder CRD is already served. That operator owns the
+// CRD and reconciles ClusterLogForwarders into Vector, and the monitoring
+// operator's spec.logs precondition refuses to reconcile without it — so the
+// log forwarding tests require it the way the Loki ones require the Loki
+// operator. Installing it also creates clusterLoggingNamespace, which the
+// operator applies the ClusterLogForwarder and its companions into.
+func (tc *TestContext) ensureClusterLoggingOperatorInstalled(t *testing.T) {
+	t.Helper()
+
+	// Like Loki: channels are versioned, and a preinstalled operator may not
+	// have a PackageManifest in the catalog.
+	forwarders := &unstructured.UnstructuredList{}
+	forwarders.SetGroupVersionKind(gvk.ClusterLogForwarder)
+	if err := tc.Client().List(tc.Context(), forwarders); err == nil {
+		t.Log("ClusterLogForwarder CRD is already available")
+		return
+	} else if !meta.IsNoMatchError(err) && !k8serr.IsNotFound(err) {
+		t.Fatalf("failed to check ClusterLogForwarder CRD: %v", err)
+	}
+
+	channel := tc.redhatOperatorsDefaultChannel(t, clusterLoggingOpName)
+	t.Logf("installing OpenShift Logging Operator from redhat-operators channel %s", channel)
+	tc.EnsureOperatorInstalled(clusterLoggingNamespace, clusterLoggingOpName, channel)
+}
+
+// redhatOperatorsDefaultChannel resolves the cluster catalog's default channel
+// for an operator package whose channels are versioned, so the suite does not
+// pin a channel that a catalog upgrade retires.
+func (tc *TestContext) redhatOperatorsDefaultChannel(t *testing.T, packageName string) string {
+	t.Helper()
+
 	manifests := &unstructured.UnstructuredList{}
 	manifests.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "packages.operators.coreos.com", Version: "v1", Kind: "PackageManifestList",
@@ -1172,21 +1433,130 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		client.InNamespace("openshift-marketplace"),
 		client.MatchingLabels{"catalog": "redhat-operators"},
 	); err != nil {
-		t.Fatalf("Loki Operator is required; failed to list redhat-operators PackageManifests: %v", err)
+		t.Fatalf("%s Operator is required; failed to list redhat-operators PackageManifests: %v", packageName, err)
 	}
 	for _, manifest := range manifests.Items {
-		if manifest.GetName() != lokiOpName {
+		if manifest.GetName() != packageName {
 			continue
 		}
 		channel, _, err := unstructured.NestedString(manifest.Object, "status", "defaultChannel")
 		if err != nil || channel == "" {
-			t.Fatalf("redhat-operators Loki PackageManifest has no default channel: %v", err)
+			t.Fatalf("redhat-operators %s PackageManifest has no default channel: %v", packageName, err)
 		}
-		t.Logf("installing Loki Operator from redhat-operators channel %s", channel)
-		tc.EnsureOperatorInstalled(lokiOpNamespace, lokiOpName, channel)
-		return
+		return channel
 	}
-	t.Fatalf("Loki Operator is required; %s PackageManifest is missing from redhat-operators", lokiOpName)
+	t.Fatalf("%s Operator is required; its PackageManifest is missing from redhat-operators", packageName)
+	return ""
+}
+
+// ensureOperatorServiceMonitor creates the operator's ServiceMonitor after COO is installed.
+// This enables metrics scraping for the odh-observability operator itself.
+func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
+	t.Helper()
+
+	// Get the operator deployment to find its namespace
+	deployments := &unstructured.UnstructuredList{}
+	deployments.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "DeploymentList",
+	})
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("failed to list odh-observability Deployment: %v", err)
+	}
+	if len(deployments.Items) == 0 {
+		t.Fatalf("odh-observability Deployment not found")
+	}
+	operatorNS := deployments.Items[0].GetNamespace()
+	monitoringNS := monitoringNamespaceFromDeployment(&deployments.Items[0])
+	if monitoringNS == "" {
+		monitoringNS = tc.MonitoringNamespace
+	}
+	if monitoringNS == "" {
+		monitoringNS = operatorNS
+	}
+	// Module-mode setup creates this namespace only after the ServiceMonitor.
+	// Konflux sets MONITORING_NAMESPACE to redhat-ods-monitoring before that
+	// namespace exists, so create it here first.
+	tc.ensureNamespaceExists(monitoringNS)
+
+	// Create the CA ConfigMap for service-ca injection
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      "odh-observability-metrics-ca",
+			Namespace: monitoringNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			annotations := map[string]any{
+				"service.beta.openshift.io/inject-cabundle": "true",
+			}
+			return unstructured.SetNestedMap(u.Object, annotations, "metadata", "annotations")
+		}),
+		WithCustomErrorMsg("operator metrics CA ConfigMap should be created"),
+	)
+
+	// Create the ServiceMonitor for operator metrics
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
+			Name:      "odh-observability-metrics",
+			Namespace: monitoringNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			spec := map[string]any{
+				"endpoints": []any{
+					map[string]any{
+						"path":            "/metrics",
+						"port":            "https",
+						"scheme":          "https",
+						"bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+						"tlsConfig": map[string]any{
+							"ca": map[string]any{
+								"configMap": map[string]any{
+									"name": "odh-observability-metrics-ca",
+									"key":  "service-ca.crt",
+								},
+							},
+							"serverName": fmt.Sprintf("odh-observability-metrics.%s.svc", operatorNS),
+						},
+					},
+				},
+				"selector": map[string]any{
+					"matchLabels": map[string]any{
+						"app.kubernetes.io/name":     "odh-observability",
+						"app.kubernetes.io/instance": "odh-observability",
+					},
+				},
+				"namespaceSelector": map[string]any{
+					"matchNames": []any{operatorNS},
+				},
+			}
+			return unstructured.SetNestedMap(u.Object, spec, "spec")
+		}),
+		WithCustomErrorMsg("operator ServiceMonitor should be created after COO CRD is available"),
+	)
+
+	t.Logf("created operator ServiceMonitor in namespace %s for Service in %s", monitoringNS, operatorNS)
+}
+
+func monitoringNamespaceFromDeployment(deployment *unstructured.Unstructured) string {
+	containers, _, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+	for _, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		envs, _, _ := unstructured.NestedSlice(container, "env")
+		for _, rawEnv := range envs {
+			env, ok := rawEnv.(map[string]any)
+			if !ok || env["name"] != "MONITORING_NAMESPACE" {
+				continue
+			}
+			if value, ok := env["value"].(string); ok {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 // Suppress unused warnings for transform functions used in later commits.
@@ -1195,3 +1565,121 @@ var (
 	_ = withEmptyMetrics
 	_ = withNoCollectorReplicas
 )
+
+// mintScopedMetricsGetToken provisions a ServiceAccount authorized for "get" on
+// pods.metrics.k8s.io in the given namespace and returns a bearer token for it.
+// Namespace proxies authorize every request with a static SAR verb "get", so this
+// token is accepted by kube-rbac-proxy for both GET and POST; the method gate
+// still rejects POST. Created RBAC is removed via t.Cleanup.
+func (tc *MonitoringTestCtx) mintScopedMetricsGetToken(t *testing.T, namespace string) string {
+	t.Helper()
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-get", namespace, "get")
+}
+
+// mintScopedMetricsToken provisions a ServiceAccount + namespaced Role/RoleBinding
+// granting the given verbs on pods.metrics.k8s.io and returns a bearer token for it.
+func (tc *MonitoringTestCtx) mintScopedMetricsToken(t *testing.T, name, namespace string, verbs ...string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+	}
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"metrics.k8s.io"},
+			Resources: []string{"pods"},
+			Verbs:     verbs,
+		}},
+	}
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: namespace}},
+	}
+
+	for _, obj := range []client.Object{sa, role, rb} {
+		require.NoError(t, client.IgnoreAlreadyExists(tc.Client().Create(tc.Context(), obj)))
+	}
+	t.Cleanup(func() {
+		_ = tc.Client().Delete(tc.Context(), rb)
+		_ = tc.Client().Delete(tc.Context(), role)
+		_ = tc.Client().Delete(tc.Context(), sa)
+	})
+
+	tr := &authenticationv1.TokenRequest{}
+	require.NoError(t, tc.Client().SubResource("token").Create(tc.Context(), sa, tr))
+	require.NotEmpty(t, tr.Status.Token, "minted ServiceAccount token must not be empty")
+
+	return tr.Status.Token
+}
+
+// routeHost returns the external host of the named Route in the monitoring namespace.
+func (tc *MonitoringTestCtx) routeHost(t *testing.T, name string) string {
+	t.Helper()
+	g := NewWithT(t)
+
+	var host string
+	g.Eventually(func() (string, error) {
+		route := tc.FetchResource(
+			WithMinimalObject(gvk.Route, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+		)
+		if route == nil {
+			return "", fmt.Errorf("Route %s not found", name)
+		}
+
+		var ingressHost string
+		if ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress"); found && len(ingress) > 0 {
+			if entry, ok := ingress[0].(map[string]any); ok {
+				ingressHost, _, _ = unstructured.NestedString(entry, "host")
+			}
+		}
+
+		if ingressHost == "" {
+			// Fall back to spec.host for clusters where the admission plugin writes it back.
+			ingressHost, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+		}
+
+		host = ingressHost
+		return host, nil
+	}).ShouldNot(BeEmpty(), "Route %s has no ingress host", name)
+
+	return host
+}
+
+// postPromQLForm issues a POST to the namespace proxy with the namespace supplied
+// both as a URL query parameter and inside the form body. It returns the HTTP
+// status and a bounded prefix of the response body. rootCAs is the cluster
+// ingress CA pool from clusterIngressCAPool.
+func postPromQLForm(ctx context.Context, rootCAs *x509.CertPool, host, token, queryNamespace, bodyNamespace string) (int, string, error) {
+	form := url.Values{}
+	form.Set("query", "up")
+	form.Set("namespace", bodyNamespace)
+
+	reqURL := fmt.Sprintf("https://%s/api/v1/query?namespace=%s", host, url.QueryEscape(queryNamespace))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 30 * time.Second,
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	if err != nil {
+		return resp.StatusCode, "", err
+	}
+
+	return resp.StatusCode, string(body), nil
+}

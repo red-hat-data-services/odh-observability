@@ -1,8 +1,11 @@
 package e2e_test
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,11 +17,22 @@ import (
 
 	gTypes "github.com/onsi/gomega/types"
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	configv1 "github.com/openshift/api/config/v1"
+	ocpcrypto "github.com/openshift/library-go/pkg/crypto"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
+	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -52,6 +66,8 @@ func monitoringTestSuite(t *testing.T) {
 		t.Run("Thanos Querier absent", phaseCtx.ValidateThanosQuerierNotDeployedWithoutMetrics)
 		t.Run("Perses absent", phaseCtx.ValidatePersesNotDeployedWithoutMetricsOrTraces)
 	})
+	// Modes before cloud Tempo/Loki so Mode 2 absence checks are not fighting leftover heavy operands.
+	t.Run("Observability Modes", monitoringServiceCtx.runObservabilityModesTests)
 	t.Run("Metrics ready", func(t *testing.T) {
 		phaseCtx := monitoringServiceCtx.WithT(t)
 		t.Cleanup(func() { phaseCtx.cleanupGroup(t, "") })
@@ -254,6 +270,11 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 		),
 		WithCustomErrorMsg("prometheus-web-tls-ca ConfigMap should exist with CA injection annotation"),
 	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: "prometheus-web-tls-ca", Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.data."service-ca.crt" != null`)),
+		WithCustomErrorMsg("prometheus-web-tls-ca Secret should contain the injected service CA"),
+	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: "prometheus-operated", Namespace: tc.MonitoringNamespace}),
@@ -404,9 +425,102 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		tc.setupMetrics(t)
 		t.Run("Test signal-specific collector contract", tc.ValidateSignalSpecificCollectorContract)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
+		t.Run("Test OTLP receiver TLS is always enabled", tc.ValidateOTLPTLSAlwaysEnabled)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
 		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
 	})
+}
+
+// ValidateOTLPTLSAlwaysEnabled validates the TLS contract for the main OTLP receiver.
+func (tc *MonitoringTestCtx) ValidateOTLPTLSAlwaysEnabled(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.ensureOpenTelemetryCollectorReady(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`[.spec.ports[] | select(.port == 4317 or .port == 4318)] | length == 2`),
+		)),
+		WithCustomErrorMsg("OTLP Service should expose gRPC and HTTP"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName + "-headless",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-collector-collector-headless-tls"`)),
+		WithCustomErrorMsg("OTLP headless Service should own the service-ca serving certificate"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-collector-collector-headless-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("service-ca should issue the OTLP headless Service certificate and key"),
+	)
+	tc.assertServiceCACertificateOriginMatchesService(
+		t,
+		OpenTelemetryCollectorServiceName+"-headless",
+		"data-science-collector-collector-headless-tls",
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == null`),
+			jq.Match(`[.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)] | length > 0`),
+			jq.Match(`.spec.volumes[] | select(.name == "otlp-tls-certs") | .secret.secretName == "data-science-collector-collector-headless-tls"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should mount the service-ca certificate and enable TLS on both OTLP receivers"),
+	)
+}
+
+func (tc *MonitoringTestCtx) assertServiceCACertificateOriginMatchesService(t *testing.T, serviceName, secretName string) {
+	t.Helper()
+
+	service, err := tc.fetchResource(t, gvk.Service, types.NamespacedName{
+		Name: serviceName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Service %s", serviceName)
+
+	secret, err := tc.fetchResource(t, gvk.Secret, types.NamespacedName{
+		Name: secretName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Secret %s", secretName)
+
+	originServiceName, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-name")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service")
+	require.Equal(t, serviceName, originServiceName)
+
+	originServiceUID, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-uid")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service UID")
+	require.Equal(t, string(service.GetUID()), originServiceUID)
 }
 
 // ValidateOpenTelemetryCollectorConfigurations consolidates all OpenTelemetry Collector configuration tests.
@@ -833,6 +947,44 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testi
 		}),
 		WithCustomErrorMsg("Target Allocator ConfigMap should be created by OpenTelemetry Operator"),
 	)
+
+	tc.g.Eventually(func() error {
+		configMap := &corev1.ConfigMap{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}, configMap); err != nil {
+			return err
+		}
+		configYAML := configMap.Data["targetallocator.yaml"]
+		if configYAML == "" {
+			return errors.New("TargetAllocator config is not populated yet")
+		}
+		var config map[string]any
+		if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+			return fmt.Errorf("decode generated TargetAllocator config: %w", err)
+		}
+		prometheusConfig, ok := config["config"].(map[string]any)
+		if !ok {
+			return errors.New("generated TargetAllocator config has no Prometheus config")
+		}
+		scrapeConfigs, ok := prometheusConfig["scrape_configs"].([]any)
+		if !ok {
+			return errors.New("generated TargetAllocator config has no scrape_configs")
+		}
+		for _, rawScrapeConfig := range scrapeConfigs {
+			scrapeConfig, ok := rawScrapeConfig.(map[string]any)
+			if !ok || scrapeConfig["job_name"] != "dcgm-exporter-accelerator-metrics" {
+				continue
+			}
+			if scrapeConfig["scheme"] != "http" {
+				return fmt.Errorf("TargetAllocator-generated DCGM job scheme=%v, want http", scrapeConfig["scheme"])
+			}
+			return nil
+		}
+		return errors.New("TargetAllocator-generated config is missing the built-in DCGM job")
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"TargetAllocator must preserve the built-in DCGM scrape job in generated config")
 }
 
 // ValidateTargetAllocatorLifecycle tests the complete lifecycle of Target Allocator deployment and cleanup.
@@ -1012,6 +1164,7 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 		})
 
 		t.Run("Integration — Thanos ⇄ Perses datasource wiring", tc.ValidateThanosPersesDatasourceIntegration)
+		t.Run("Integration — Perses datasource proxy namespace scoping", tc.ValidatePersesDatasourceProxyNamespaceScoping)
 	})
 }
 
@@ -1122,6 +1275,8 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.status.readyReplicas == 1`),
 			jq.Match(`.spec.template.spec.serviceAccountName == "%s"`, ThanosQuerierProxyName),
 			jq.Match(`.spec.template.spec.containers | map(.name) | contains(["kube-rbac-proxy", "prom-label-proxy"])`),
+			// Perses Project=All sends namespace=a&namespace=b; --regex-match rejects that.
+			jq.Match(`[.spec.template.spec.containers[]? | select(.name == "prom-label-proxy") | select(.args | index("--regex-match"))] | length == 0`),
 		)),
 		WithCustomErrorMsg("Thanos Querier proxy deployment should be ready with both authorization containers"),
 	)
@@ -1187,6 +1342,9 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.spec.podSelector.matchLabels.app == "%s"`, ThanosQuerierProxyName),
 			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["policy-group.network.openshift.io/ingress"] == ""`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8443`),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels.instance == "%s"`, PersesName),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "%s"`, PersesName),
+			jq.Match(`.spec.ingress[1].ports[0].port == 8443`),
 		)),
 	)
 }
@@ -1276,7 +1434,7 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 		"Component=Thanos Assertion=promql-response: Route %s has no ingress host", ThanosQuerierRouteName)
 
 	token := authorizedThanosProbeToken(t, tc,
-		"thanos-baseline-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+		"thanos-baseline-"+strconv.FormatInt(time.Now().UnixNano(), 10), true)
 
 	endpoint := url.URL{Scheme: "https", Host: host, Path: "/api/v1/query"}
 	parameters := endpoint.Query()
@@ -1399,22 +1557,25 @@ func (tc *MonitoringTestCtx) ValidateThanosPersesDatasourceIntegration(t *testin
 
 	tc.ensureMetricsManaged()
 
-	expectedThanosURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:10902", thanosQuerierDeploymentName, tc.MonitoringNamespace)
+	expectedProxyURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443", ThanosQuerierProxyName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedThanosURL),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedProxyURL),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "data-science-prometheus-datasource-secret"`),
 		)),
 		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: "+
-			"PersesDatasource %s does not route through HTTPProxy to Thanos Querier at %s", PersesDatasourceName, expectedThanosURL),
+			"PersesDatasource %s does not route through HTTPProxy to Thanos namespace proxy at %s", PersesDatasourceName, expectedProxyURL),
 	)
 
 	t.Logf(
 		"✓ THANOS ⇄ PERSES DATASOURCE WIRING OK\n"+
-			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s\n",
-		PersesDatasourceName, expectedThanosURL)
+			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s (namespace-enforcing)\n",
+		PersesDatasourceName, expectedProxyURL)
 }
 
 func (tc *MonitoringTestCtx) ValidateThanosComponentVersionBoundaryUnsupported(t *testing.T) {
@@ -1523,7 +1684,7 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "data-science-tempomonolithic"`),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
 			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080]`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080, 8090]`),
 		)),
 		WithCustomErrorMsg("TempoMonolithic NetworkPolicy should expose only the collector, Prometheus, and Perses paths"),
 	)
@@ -1876,7 +2037,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
 
-	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorName, tc.MonitoringNamespace)
+	expectedEndpoint := fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
@@ -1885,6 +2046,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 			jq.Match(`.metadata.generation >= 1`),
 			jq.Match(`
 				(.spec.exporter.endpoint == "%s") and
+				(.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
 				(.spec.sampler.type == "traceidratio") and
 				(.spec.sampler.argument == "0.1")
 			`, expectedEndpoint),
@@ -2157,6 +2319,9 @@ func (tc *MonitoringTestCtx) ValidatePersesCRConfiguration(t *testing.T) {
 		WithMinimalObject(gvk.Perses, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.containerPort == 8080`),
+			// Do not assert .spec.config.security == null: perses-operator
+			// defaults security on the live CR (manager=manager Update). Our
+			// template omits it; the operand fills enable_auth/authn defaults.
 			jq.Match(`.spec.config.database.file != null`),
 			jq.Match(`(.apiVersion | contains("v1alpha1") | not) or .spec.storage.size == "1Gi"`),
 			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
@@ -2409,13 +2574,18 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
-			jq.Match(`.spec.config.default == false`),
+			jq.Match(`.spec.config.default == true`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier-data-science-thanos-querier")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("data-science-thanos-querier-proxy")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":8443")`),
 			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("%s")`, tc.MonitoringNamespace),
+			jq.Match(`(.spec.config.plugin.spec.proxy.spec.url | contains(":10902")) | not`),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "data-science-prometheus-datasource-secret"`),
 		)),
-		WithCustomErrorMsg("Data Science PersesDatasource CR should be created with correct Thanos Querier proxy configuration"),
+		WithCustomErrorMsg("Data Science PersesDatasource CR should route through the namespace-enforcing Thanos proxy"),
 	)
 
 	tc.EnsureResourceExists(
@@ -2423,14 +2593,49 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
-			jq.Match(`.spec.config.default == true`),
+			jq.Match(`.spec.config.default == false`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier.openshift-monitoring")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":9091")`),
+			jq.Match(`(.spec.config.plugin.spec.queryParams // {}) | length == 0`),
 			jq.Match(`.spec.client.tls.enable == true`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "%s"`, ClusterPrometheusDatasourceSecret),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "cluster-prometheus-datasource-secret"`),
 		)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource CR should be created with correct openshift-monitoring Thanos Querier configuration"),
+		WithCustomErrorMsg("Cluster PersesDatasource should use caller token on :9091 (no shared SA, not default)"),
+	)
+
+	// If a K8s Secret still exists under the shared name, it must not be an SA token.
+	var clusterDSSecret corev1.Secret
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name:      "cluster-prometheus-datasource-secret",
+		Namespace: tc.MonitoringNamespace,
+	}, &clusterDSSecret)
+	if err == nil {
+		if clusterDSSecret.Type == corev1.SecretTypeServiceAccountToken {
+			t.Fatal("cluster-prometheus-datasource-secret must not be a shared service-account token")
+		}
+		if clusterDSSecret.Annotations["kubernetes.io/service-account.name"] == "data-science-prometheus-cluster-proxy" {
+			t.Fatal("cluster-prometheus-datasource-secret must not reference the cluster-proxy SA")
+		}
+	} else if !k8serr.IsNotFound(err) {
+		t.Fatalf("reading cluster-prometheus-datasource-secret: %v", err)
+	}
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			tc.monitoringOwnerReferencesCondition(),
+			jq.Match(`.spec.config.default == false`),
+			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier.openshift-monitoring")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":9092")`),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "cluster-prometheus-tenancy-datasource-secret"`),
+		)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should use caller token on :9092 with namespace="),
 	)
 }
 
@@ -2453,7 +2658,13 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusDatasourceName)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource should exist when metrics are configured"),
+		WithCustomErrorMsg("Cluster PersesDatasource should exist when metrics are configured"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusTenancyDatasourceName)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should exist when metrics are configured"),
 	)
 
 	tc.updateMonitoringConfig(
@@ -2476,6 +2687,10 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+	)
 	tc.waitForPrometheusPodsGone(t)
 
 	tc.updateMonitoringConfig(
@@ -2492,7 +2707,13 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusDatasourceName)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource should be recreated when metrics are re-enabled"),
+		WithCustomErrorMsg("Cluster PersesDatasource should be recreated when metrics are re-enabled"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusTenancyDatasourceName)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should be recreated when metrics are re-enabled"),
 	)
 }
 
@@ -2509,11 +2730,17 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 
 		t.Run("Prometheus restricted resource configuration", tc.ValidatePrometheusRestrictedResourceConfiguration)
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
+		t.Run("Monitoring proxy TLS profile rollout", tc.ValidateMonitoringProxyTLSProfileRollout)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("Built-in DCGM opt-out with verified HTTPS monitor", tc.ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+		t.Run("Namespace isolation POST form bypass", tc.ValidateNamespaceIsolationPostFormBypass)
+		t.Run("Operator metrics authentication and authorization", tc.ValidateOperatorMetricsAuthenticationAndAuthorization)
 		t.Run("Operand NetworkPolicies and lifecycle", tc.ValidateOperandNetworkPolicies)
+		t.Run("Collector and TargetAllocator NetworkPolicy contract", tc.ValidateCollectorNetworkPolicyContract)
+		t.Run("Collector OTLP namespace authorization", tc.ValidateCollectorOTLPNamespaceBoundary)
 	})
 }
 
@@ -2546,7 +2773,8 @@ func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *
 		}),
 		WithCondition(And(
 			jq.Match(`.status.readyReplicas == 1`),
-			jq.Match(`.spec.template.spec.containers | length == 2`),
+			jq.Match(`.spec.template.spec.containers | length == 3`),
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["kube-rbac-proxy", "method-gate", "prom-label-proxy"])`),
 		)),
 		WithCustomErrorMsg("data-science-prometheus-namespace-proxy deployment should be created and ready"),
 	)
@@ -2664,7 +2892,8 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream="))) | length == 1`),
-			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9091/"))) | length == 1`),
+			// kube-rbac-proxy forwards to the method gate (:9092), not directly to prom-label-proxy (:9091).
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9092/"))) | length == 1`),
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--secure-listen-address=0.0.0.0:8443"))) | length == 1`),
 		)),
 		WithCustomErrorMsg("kube-rbac-proxy should be configured with correct upstream and secure listen address"),
@@ -2680,6 +2909,233 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should reference system:auth-delegator for authentication and authorization"),
 	)
+}
+
+func (tc *MonitoringTestCtx) ValidateMonitoringProxyTLSProfileRollout(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	tc.setupMetrics(t)
+
+	proxyDeployments := []string{
+		"data-science-prometheus-namespace-proxy",
+		"data-science-prometheus-cluster-proxy",
+		ThanosQuerierProxyName,
+	}
+
+	for _, deploymentName := range proxyDeployments {
+		deploymentKey := types.NamespacedName{
+			Name:      deploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}
+		tc.EnsureDeploymentReady(WithMinimalObject(gvk.Deployment, deploymentKey))
+
+		deployment := tc.FetchResource(WithMinimalObject(gvk.Deployment, deploymentKey))
+		containers, found, err := unstructured.NestedSlice(
+			deployment.Object, "spec", "template", "spec", "containers",
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		var proxyContainer map[string]any
+		for _, rawContainer := range containers {
+			container, ok := rawContainer.(map[string]any)
+			require.True(t, ok)
+			if container["name"] == "kube-rbac-proxy" {
+				proxyContainer = container
+				break
+			}
+		}
+		require.NotNil(t, proxyContainer, "kube-rbac-proxy container not found in %s", deploymentName)
+
+		args, found, err := unstructured.NestedStringSlice(proxyContainer, "args")
+		require.NoError(t, err)
+		require.True(t, found)
+
+		expected := tc.expectedKubeRBACProxyTLSArgs(t)
+
+		minVersion, found := findProxyArg(args, "--tls-min-version=")
+		require.True(t, found, "%s must set --tls-min-version", deploymentName)
+		require.Equal(t, expected.minVersion, minVersion)
+
+		cipherSuites, found := findProxyArg(args, "--tls-cipher-suites=")
+		if expected.cipherSuites == "" {
+			require.False(t, found, "TLS 1.3 must not restrict cipher suites in %s", deploymentName)
+		} else {
+			require.True(t, found, "TLS 1.2 must set cipher suites in %s", deploymentName)
+			require.Equal(t, expected.cipherSuites, cipherSuites)
+		}
+
+		curvePreferences, found := findProxyArg(args, "--tls-curve-preferences=")
+		if expected.curvePreferences == "" {
+			require.False(t, found, "%s must omit curve preferences when no usable groups are configured", deploymentName)
+		} else {
+			require.True(t, found, "%s must set curve preferences", deploymentName)
+			require.Equal(t, expected.curvePreferences, curvePreferences)
+		}
+
+		_, found = findProxyArg(args, "--tls-cipher-suite=")
+		require.False(t, found, "%s uses kube-rbac-proxy and must use the plural cipher flag", deploymentName)
+	}
+}
+
+type expectedProxyTLSArgs struct {
+	minVersion       string
+	cipherSuites     string
+	curvePreferences string
+}
+
+func (tc *MonitoringTestCtx) expectedKubeRBACProxyTLSArgs(t *testing.T) expectedProxyTLSArgs {
+	t.Helper()
+
+	profile := tc.expectedClusterTLSProfile(t)
+	spec := expectedProxyTLSProfileSpec(t, profile)
+	minVersion := expectedProxyTLSMinVersion(t, spec.MinTLSVersion)
+
+	cipherSuites := ""
+	if minVersion == "VersionTLS12" {
+		cipherSuites = expectedProxyTLSCipherSuites(spec.Ciphers)
+	}
+
+	return expectedProxyTLSArgs{
+		minVersion:       minVersion,
+		cipherSuites:     cipherSuites,
+		curvePreferences: tc.expectedProxyTLSCurvePreferences(t, spec.Groups),
+	}
+}
+
+func (tc *MonitoringTestCtx) expectedClusterTLSProfile(t *testing.T) *configv1.TLSSecurityProfile {
+	t.Helper()
+
+	apiServer := &configv1.APIServer{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: "cluster"}, apiServer)
+	if k8serr.IsNotFound(err) || meta.IsNoMatchError(err) {
+		return nil
+	}
+	require.NoError(t, err, "failed to get cluster APIServer configuration")
+
+	switch apiServer.Spec.TLSAdherence {
+	case configv1.TLSAdherencePolicyNoOpinion, configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
+		return nil
+	default:
+		return apiServer.Spec.TLSSecurityProfile
+	}
+}
+
+func expectedProxyTLSProfileSpec(t *testing.T, profile *configv1.TLSSecurityProfile) configv1.TLSProfileSpec {
+	t.Helper()
+
+	if profile == nil || profile.Type == "" {
+		return *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+	}
+	if profile.Type == configv1.TLSProfileCustomType {
+		require.NotNil(t, profile.Custom, "strict custom TLS profile must define a specification")
+		return profile.Custom.TLSProfileSpec
+	}
+
+	spec, ok := configv1.TLSProfiles[profile.Type]
+	require.True(t, ok, "unsupported strict TLS profile type %q", profile.Type)
+	return *spec
+}
+
+func expectedProxyTLSMinVersion(t *testing.T, minVersion configv1.TLSProtocolVersion) string {
+	t.Helper()
+
+	switch minVersion {
+	case configv1.VersionTLS12:
+		return "VersionTLS12"
+	case configv1.VersionTLS13:
+		return "VersionTLS13"
+	default:
+		t.Fatalf("kube-rbac-proxy cannot represent minimum TLS version %q", minVersion)
+		return ""
+	}
+}
+
+func expectedProxyTLSCipherSuites(ciphers []string) string {
+	ianaCiphers := ocpcrypto.OpenSSLToIANACipherSuites(ciphers)
+	filtered := make([]string, 0, len(ianaCiphers))
+	for _, cipher := range ianaCiphers {
+		code, err := ocpcrypto.CipherSuite(cipher)
+		if err != nil || code&0xff00 == 0x1300 {
+			continue
+		}
+		filtered = append(filtered, cipher)
+	}
+	if len(filtered) == 0 {
+		filtered = ocpcrypto.OpenSSLToIANACipherSuites(
+			configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers,
+		)
+	}
+	return strings.Join(filtered, ",")
+}
+
+func (tc *MonitoringTestCtx) expectedProxyTLSCurvePreferences(t *testing.T, groups []configv1.TLSGroup) string {
+	t.Helper()
+
+	if len(groups) == 0 {
+		return ""
+	}
+
+	curves, _ := ocpcrypto.TLSGroupsToCurveIDs(groups)
+	fipsEnabled := tc.expectedClusterFIPSEnabled(t)
+	allowedCurves := map[int]struct{}{
+		23: {}, 24: {}, 25: {}, 29: {}, 4588: {},
+	}
+	if fipsEnabled {
+		allowedCurves = map[int]struct{}{23: {}, 24: {}, 25: {}}
+	}
+
+	seen := make(map[int]struct{}, len(curves))
+	curveIDs := make([]string, 0, len(curves))
+	for _, curve := range curves {
+		if _, ok := allowedCurves[int(curve)]; !ok {
+			continue
+		}
+		if _, ok := seen[int(curve)]; ok {
+			continue
+		}
+		seen[int(curve)] = struct{}{}
+		curveIDs = append(curveIDs, strconv.Itoa(int(curve)))
+	}
+
+	require.NotEmpty(t, curveIDs, "strict TLS profile groups contain no kube-rbac-proxy-supported curves")
+	return strings.Join(curveIDs, ",")
+}
+
+func (tc *MonitoringTestCtx) expectedClusterFIPSEnabled(t *testing.T) bool {
+	t.Helper()
+
+	configMap := &corev1.ConfigMap{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Namespace: "kube-system",
+		Name:      "cluster-config-v1",
+	}, configMap)
+	if k8serr.IsNotFound(err) {
+		return false
+	}
+	require.NoError(t, err, "failed to get cluster install configuration")
+
+	installConfig := configMap.Data["install-config"]
+	if installConfig == "" {
+		return false
+	}
+
+	var parsedInstallConfig struct {
+		FIPS bool `yaml:"fips"`
+	}
+	if err := yaml.Unmarshal([]byte(installConfig), &parsedInstallConfig); err != nil {
+		return strings.Contains(strings.ToLower(installConfig), "fips: true")
+	}
+	return parsedInstallConfig.FIPS
+}
+
+func findProxyArg(args []string, prefix string) (string, bool) {
+	for _, arg := range args {
+		if value, found := strings.CutPrefix(arg, prefix); found {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T) {
@@ -2835,6 +3291,333 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 	)
 }
 
+func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EnsureResourceDoesNotExist(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{Name: "data-science-metrics-view"}),
+		WithCustomErrorMsg("ClusterRole 'data-science-metrics-view' must not exist"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
+			// Defense-in-depth: a method gate rejects non-GET/HEAD before prom-label-proxy,
+			// and kube-rbac-proxy forwards to it (:9092) rather than to prom-label-proxy (:9091).
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["method-gate"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "kube-rbac-proxy") | .args | contains(["--upstream=http://127.0.0.1:9092/"])`),
+		)),
+		WithCustomErrorMsg("namespace proxy must have the method gate and route kube-rbac-proxy through it"),
+	)
+
+	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy")
+
+	host := tc.routeHost(t, "data-science-prometheus-route")
+	rootCAs := clusterIngressCAPool(t, tc)
+
+	// Token authorized for "get" on pods.metrics.k8s.io. The proxy ConfigMap uses a
+	// static resourceAttributes.verb: get, so kube-rbac-proxy authorizes this POST;
+	// only the method gate can reject it. Asserting the gate body proves the 403 is
+	// not from kube-rbac-proxy.
+	getToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
+
+	g := NewWithT(t)
+	g.Eventually(func(g Gomega) {
+		status, body, err := postPromQLForm(tc.Context(), rootCAs, host, getToken, tc.MonitoringNamespace, "openshift-monitoring")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(status).To(Equal(http.StatusForbidden),
+			"POST with a get-authorized token must be rejected with 403 by the method gate; got %d", status)
+		g.Expect(body).To(ContainSubstring("only GET and HEAD are allowed"))
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+}
+
+func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorization(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.verifyOperatorMetricsRBAC(t)
+
+	// The suite creates this ServiceMonitor during module-mode setup only.
+	// DSC runs the same test, and the chart leaves the CA out unless
+	// metrics.serviceMonitor.enabled is set, so create it here for both modes.
+	tc.ensureOperatorServiceMonitor(t)
+
+	// ensureOperatorDeploymentReady returns MONITORING_NAMESPACE. The metrics
+	// Service and its DNS name live in the operator Deployment namespace.
+	// NetworkPolicy accepts :8443 only from the monitoring namespace, so the
+	// probe has to run in a pod there rather than in the test process.
+	monitoringNS := tc.ensureOperatorDeploymentReady(t)
+	operatorNS := tc.operatorDeploymentNamespace(t)
+	serviceHost := fmt.Sprintf("odh-observability-metrics.%s.svc:8443", operatorNS)
+	tc.waitForOperatorMetricsCA(t, monitoringNS)
+	tc.ensureOperatorMetricsProbePod(t, monitoringNS)
+
+	t.Run("Unauthenticated request returns 401", func(t *testing.T) {
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, "")
+		if statusCode != http.StatusUnauthorized {
+			t.Errorf("unauthenticated request to /metrics should return 401, got %d", statusCode)
+		}
+	})
+
+	t.Run("Unauthorized request returns 403", func(t *testing.T) {
+		unauthorizedSA := tc.createServiceAccountForMetricsTest(t, operatorNS, "metrics-unauthorized-test")
+		unauthorizedToken := tc.getServiceAccountToken(t, operatorNS, unauthorizedSA)
+
+		statusCode := tc.probeOperatorMetrics(t, monitoringNS, serviceHost, unauthorizedToken)
+		if statusCode != http.StatusForbidden {
+			t.Errorf("unauthorized request to /metrics should return 403, got %d", statusCode)
+		}
+	})
+
+	t.Run("Authorized request returns 200", func(t *testing.T) {
+		prometheusSA := fmt.Sprintf("%s-prometheus", MonitoringStackName)
+		tokenNamespace := tc.MonitoringNamespace
+		if tokenNamespace == "" {
+			tokenNamespace = monitoringNS
+		}
+		authorizedToken := tc.getServiceAccountToken(t, tokenNamespace, prometheusSA)
+
+		var statusCode int
+		tc.g.Eventually(func() error {
+			statusCode = tc.probeOperatorMetrics(t, monitoringNS, serviceHost, authorizedToken)
+			if statusCode != http.StatusOK {
+				return fmt.Errorf("authorized request to /metrics should return 200, got %d", statusCode)
+			}
+			return nil
+		}).WithTimeout(30*time.Second).Should(Succeed(),
+			"Prometheus ServiceAccount should be able to scrape operator metrics")
+	})
+}
+
+func (tc *MonitoringTestCtx) verifyOperatorMetricsRBAC(t *testing.T) {
+	t.Helper()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`[.rules[] | select(.nonResourceURLs[]? == "/metrics")] | any`),
+			jq.Match(`[.rules[] | select(.verbs[]? == "get")] | any`),
+		)),
+		WithCustomErrorMsg("ClusterRole odh-observability-metrics-reader should grant GET on /metrics"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "odh-observability-metrics-reader"`),
+			jq.Match(`[.subjects[] | select(.kind == "ServiceAccount" and .name == "%s")] | any`, fmt.Sprintf("%s-prometheus", MonitoringStackName)),
+			jq.Match(`[.subjects[] | select(.namespace == "%s")] | any`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind Prometheus SA to metrics-reader role"),
+	)
+
+	t.Logf("Operator metrics RBAC resources verified")
+}
+
+func (tc *MonitoringTestCtx) createServiceAccountForMetricsTest(t *testing.T, namespace, name string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), sa); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create test ServiceAccount %s/%s: %v", namespace, name, err)
+	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), sa); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to clean up test ServiceAccount %s/%s: %v", namespace, name, err)
+		}
+	})
+	return name
+}
+
+func (tc *MonitoringTestCtx) getServiceAccountToken(t *testing.T, namespace, serviceAccountName string) string {
+	t.Helper()
+
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Fatalf("failed to load Kubernetes config for token: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatalf("failed to create Kubernetes client for token: %v", err)
+	}
+
+	tokenRequest, err := clientset.CoreV1().ServiceAccounts(namespace).CreateToken(
+		tc.Context(),
+		serviceAccountName,
+		&authenticationv1.TokenRequest{},
+		metav1.CreateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("failed to create token for ServiceAccount %s/%s: %v", namespace, serviceAccountName, err)
+	}
+	if tokenRequest.Status.Token == "" {
+		t.Fatalf("TokenRequest for ServiceAccount %s/%s returned empty token", namespace, serviceAccountName)
+	}
+	return tokenRequest.Status.Token
+}
+
+const (
+	operatorMetricsProbePodName = "operator-metrics-auth-probe"
+	operatorMetricsCAConfigMap  = "odh-observability-metrics-ca"
+)
+
+func (tc *MonitoringTestCtx) waitForOperatorMetricsCA(t *testing.T, monitoringNS string) {
+	t.Helper()
+
+	tc.g.Eventually(func() error {
+		caConfigMap := &corev1.ConfigMap{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsCAConfigMap,
+			Namespace: monitoringNS,
+		}, caConfigMap); err != nil {
+			return err
+		}
+		if caConfigMap.Data["service-ca.crt"] == "" {
+			return fmt.Errorf("service-ca.crt is not injected into %s/%s yet", monitoringNS, operatorMetricsCAConfigMap)
+		}
+		return nil
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics CA ConfigMap should exist in the monitoring namespace")
+}
+
+func (tc *MonitoringTestCtx) ensureOperatorMetricsProbePod(t *testing.T, monitoringNS string) {
+	t.Helper()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyAlways,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "curl",
+				Image:           fakeGCSClientImage,
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Command:         []string{"sleep", "3600"},
+				SecurityContext: fixtureContainerSecurityContext(),
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "metrics-ca",
+					MountPath: "/ca",
+					ReadOnly:  true,
+				}},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "metrics-ca",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: operatorMetricsCAConfigMap},
+					},
+				},
+			}},
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), pod); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create operator metrics probe pod: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), pod); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to delete operator metrics probe pod: %v", err)
+		}
+	})
+
+	tc.g.Eventually(func() error {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      operatorMetricsProbePodName,
+			Namespace: monitoringNS,
+		}, current); err != nil {
+			return err
+		}
+		if current.Status.Phase != corev1.PodRunning {
+			return fmt.Errorf("probe pod is %s", current.Status.Phase)
+		}
+		for _, container := range current.Status.ContainerStatuses {
+			if container.Name == "curl" && container.Ready {
+				return nil
+			}
+		}
+		return errors.New("curl container is not ready")
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"operator metrics probe pod should be running in the monitoring namespace")
+}
+
+func (tc *MonitoringTestCtx) probeOperatorMetrics(t *testing.T, monitoringNS, serviceHost, token string) int {
+	t.Helper()
+
+	args := []string{
+		"curl", "--noproxy", "*", "-sS",
+		"--connect-timeout", "5", "--max-time", "10",
+		"--cacert", "/ca/service-ca.crt",
+		"-o", "/dev/null", "-w", "%{http_code}",
+	}
+	if token != "" {
+		args = append(args, "-H", "Authorization: Bearer "+token)
+	}
+	args = append(args, "https://"+serviceHost+"/metrics")
+
+	stdout, stderr, err := tc.execOperatorMetricsProbe(t, monitoringNS, args)
+	statusCode, convErr := strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil || convErr != nil || statusCode == 0 {
+		t.Logf("operator metrics probe from %s/%s failed: status=%q err=%v stderr=%s",
+			monitoringNS, operatorMetricsProbePodName, strings.TrimSpace(stdout), err, strings.TrimSpace(stderr))
+		return 0
+	}
+	t.Logf("operator metrics probe from %s: status=%d", monitoringNS, statusCode)
+	return statusCode
+}
+
+func (tc *MonitoringTestCtx) execOperatorMetricsProbe(t *testing.T, monitoringNS string, command []string) (string, string, error) {
+	t.Helper()
+
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("load kubeconfig for pod exec: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes client for pod exec: %w", err)
+	}
+	request := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(operatorMetricsProbePodName).
+		Namespace(monitoringNS).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "curl",
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, clientgoscheme.ParameterCodec)
+	executor, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, request.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes pod exec stream: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 30*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
+}
+
 // ========================================================================
 // Lifecycle transitions and final cleanup
 // ========================================================================
@@ -2915,6 +3698,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.PersesDatasource, name: ClusterPrometheusTenancyDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.NetworkPolicy, name: UsageLogsCollectorNetworkPolicyName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.NetworkPolicy, name: UsageLogsLokiStackNetworkPolicyName, namespace: tc.MonitoringNamespace},
 	} {

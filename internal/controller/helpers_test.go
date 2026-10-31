@@ -260,9 +260,80 @@ func TestSyncPrometheusWebTLSCA_NoMetrics(t *testing.T) {
 	m.Spec.Metrics = nil
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected ready without metrics, got ready=%v error=%v", ready, err)
+	}
+}
+
+func TestSyncHelpersUseConfiguredMonitoringNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "custom-monitoring")
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	configMap := &unstructured.Unstructured{}
+	configMap.SetAPIVersion("v1")
+	configMap.SetKind("ConfigMap")
+	configMap.SetNamespace("custom-monitoring")
+	configMap.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(configMap.Object, map[string]string{
+		serviceCACertificateKey: "test-ca",
+	}, "data")
+
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      thanosQuerierRouteName,
+			Namespace: "custom-monitoring",
+		},
+		Spec: routev1.RouteSpec{
+			TLS: &routev1.TLSConfig{
+				Termination: routev1.TLSTerminationReencrypt,
+			},
+		},
+		Status: routev1.RouteStatus{
+			Ingress: []routev1.RouteIngress{{Host: "thanos.example.com"}},
+		},
+	}
+
+	s := newTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(configMap, route).
+		WithStatusSubresource(route).
+		Build()
+
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("syncPrometheusWebTLSCA: ready=%v error=%v", ready, err)
+	}
+	var secret corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{
+		Namespace: "custom-monitoring",
+		Name:      prometheusWebTLSCAConfigMapName,
+	}, &secret); err != nil {
+		t.Fatalf("CA Secret was not synchronized in the configured namespace: %v", err)
+	}
+
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+		t.Fatalf("syncThanosQuerierRouteDestinationCA: %v", err)
+	}
+	if err := cli.Get(context.Background(), types.NamespacedName{
+		Namespace: "custom-monitoring",
+		Name:      thanosQuerierRouteName,
+	}, route); err != nil {
+		t.Fatalf("Thanos route was not found in the configured namespace: %v", err)
+	}
+	if route.Spec.TLS.DestinationCACertificate != "test-ca" {
+		t.Fatalf("Thanos route CA mismatch: got %q", route.Spec.TLS.DestinationCACertificate)
+	}
+
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("syncStatusURL: %v", err)
+	}
+	if m.Status.URL != "https://thanos.example.com" {
+		t.Fatalf("status URL mismatch: got %q", m.Status.URL)
 	}
 }
 
@@ -274,9 +345,9 @@ func TestSyncPrometheusWebTLSCA_ConfigMapMissing(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("expected no error when ConfigMap missing, got: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || ready {
+		t.Fatalf("expected pending when ConfigMap missing, got ready=%v error=%v", ready, err)
 	}
 }
 
@@ -297,9 +368,9 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	}, "data")
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected ready after Secret creation, got ready=%v error=%v", ready, err)
 	}
 
 	secret := &unstructured.Unstructured{}
@@ -327,6 +398,16 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	if string(decoded) != "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----" {
 		t.Errorf("decoded cert mismatch: %q", string(decoded))
 	}
+	if err := cli.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("deleting CA Secret: %v", err)
+	}
+	ready, err = syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || !ready {
+		t.Fatalf("expected deleted CA Secret to be recreated, got ready=%v error=%v", ready, err)
+	}
+	if err := cli.Get(context.Background(), objKey(m.Spec.Namespace, prometheusWebTLSCAConfigMapName), secret); err != nil {
+		t.Fatalf("CA Secret was not recreated: %v", err)
+	}
 }
 
 func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
@@ -344,9 +425,9 @@ func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
 	// No data field at all
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
-	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
-	if err != nil {
-		t.Fatalf("expected no error when ConfigMap has no data: %v", err)
+	ready, err := syncPrometheusWebTLSCA(context.Background(), cli, m)
+	if err != nil || ready {
+		t.Fatalf("expected pending when ConfigMap has no data, got ready=%v error=%v", ready, err)
 	}
 }
 
