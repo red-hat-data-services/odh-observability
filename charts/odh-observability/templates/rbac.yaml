@@ -14,12 +14,13 @@ rules:
     verbs: ["get", "update", "patch"]
   # COO / Prometheus (RHOBS API group)
   - apiGroups: ["monitoring.rhobs"]
-    resources: ["monitoringstacks", "thanosqueriers", "servicemonitors", "prometheusrules"]
+    resources: ["monitoringstacks", "thanosqueriers", "servicemonitors", "podmonitors", "prometheusrules"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Upstream Prometheus Operator (granted via cluster-monitoring-view binding)
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["prometheuses/api"]
     verbs: ["get", "create", "update"]
+  # Read-only: granted to the collector via collector-rbac (operator must hold what it grants)
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["podmonitors", "servicemonitors"]
     verbs: ["*"]
@@ -73,18 +74,60 @@ rules:
   - apiGroups: ["perses.dev"]
     resources: ["perses", "persesdatasources", "persesdashboards"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Admission policies and webhook configuration
+  # Admission policies (ValidatingAdmissionPolicy deployed by reconciler)
   - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingwebhookconfigurations"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # cert-manager (for webhook TLS provisioning)
-  - apiGroups: ["cert-manager.io"]
-    resources: ["issuers", "certificates"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # RBAC
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create"]
+  # The controller applies and removes only its own named RBAC objects.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    resourceNames: ["data-science-collector-targetallocator-secrets"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames:
+      - data-science-collector-mlflow-trace-export
+      - data-science-collector-tempo-trace-export
+      - data-science-metrics-view
+      - data-science-usage-logs-processor
+      - generate-processors-role
+      - generate-processors-targetallocator-role
+      - korrel8r-query
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    resourceNames:
+      - data-science-cluster-log-forwarder-collector-collect-app-logs
+      - data-science-cluster-log-forwarder-collector-loki-writer
+      - data-science-collector-mlflow-trace-export
+      - data-science-collector-tempo-trace-export
+      - data-science-monitoringstack-alertmanager-prometheus-metrics-reader
+      - data-science-prometheus-cluster-proxy
+      - data-science-prometheus-cluster-proxy-auth-delegator
+      - data-science-prometheus-namespace-proxy
+      - data-science-prometheus-namespace-proxy-auth-delegator
+      - data-science-thanos-querier-proxy
+      - data-science-thanos-querier-proxy-auth-delegator
+      - data-science-usage-logs-processor
+      - generate-processors-collector-rolebinding
+      - generate-processors-targetallocator-discovery-rolebinding
+      - generate-processors-targetallocator-rolebinding
+      - korrel8r-auth-delegator
+      - korrel8r-query
+    verbs: ["update", "patch", "delete"]
+  # Older usage-logs objects can still be present during an upgrade.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["usage-logs-processor"]
+    verbs: ["delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    resourceNames: ["usage-logs-processor", "usage-logs-loki-writer", "data-science-usage-logs-loki-writer"]
+    verbs: ["delete"]
   # Networking
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
@@ -137,10 +180,14 @@ rules:
   - apiGroups: ["route.openshift.io"]
     resources: ["routes/custom-host"]
     verbs: ["create"]
-  # OLM operator conditions (read-only, for precondition checks)
+  # OLMv0 operator conditions (read-only, for precondition checks)
   - apiGroups: ["operators.coreos.com"]
     resources: ["operatorconditions"]
     verbs: ["get", "list", "watch"]
+  # OLMv0 installed CSV version lookup
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["clusterserviceversions"]
+    verbs: ["list"]
   # OLMv1 operator installation status (read-only, for precondition checks)
   - apiGroups: ["olm.operatorframework.io"]
     resources: ["clusterextensions"]
@@ -160,10 +207,11 @@ rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]
     verbs: ["create"]
-  # Metrics API (operator must hold this to grant it via data-science-metrics-view ClusterRole)
+  # Metrics API (read-only; POST/"create" is intentionally not granted so the
+  # namespace proxy rejects POST and cannot be bypassed via a POST-body namespace)
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
-    verbs: ["get", "list", "create"]
+    verbs: ["get", "list"]
   # MLflow (operator must hold this to grant it via collector-mlflow-trace-export ClusterRole)
   - apiGroups: ["mlflow.kubeflow.org"]
     resources: ["experiments"]
