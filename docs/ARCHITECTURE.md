@@ -46,7 +46,7 @@ Before any feature deployment, the reconciler verifies prerequisite operators th
 | `tempo-operator` | Traces configured |
 | `opentelemetry-operator` | Metrics, traces, or usage logs configured |
 | `cert-manager` | Operator webhook and metrics TargetAllocator mTLS certificates |
-| `loki-operator` | Usage logs or cluster log forwarding configured |
+| `loki-operator` | Usage-log storage or cluster log forwarding configured |
 | `cluster-logging` | Cluster log forwarding configured |
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
@@ -121,7 +121,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 3 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
 | 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
-| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
+| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (current-generation `Ready=True`) | collector, RBAC, ServiceMonitors, Prometheus service |
 | 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
 | 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
 | 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
@@ -171,6 +171,36 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `collector-servicemonitors.tmpl.yaml` | ServiceMonitors for collector metrics |
 | `collector-prometheus-service.tmpl.yaml` | Prometheus receiver service |
 
+### MaaS Usage Logs
+
+`deployLokiStacks` reconciles usage logs through `deployUsageLogsLokiStack` and
+`deployUsageLogsCollector`. `spec.usageLogs.storage` enables the local LokiStack;
+`spec.usageLogs.exporters` enables remote delivery. Either is sufficient to
+configure the collector, and setting both produces local and remote writes.
+
+| Template | Resources Created |
+|----------|-------------------|
+| `usage-logs-opentelemetry-collector.tmpl.yaml` | `OpenTelemetryCollector/data-science-usage-logs` with local and/or remote logs pipelines |
+| `usage-logs-opentelemetry-collector-rbac.tmpl.yaml` | Collector ServiceAccount and enrichment/export RBAC |
+| `usage-logs-opentelemetry-collector-network-policy.tmpl.yaml` | Usage-log collector ingress policy |
+| `usage-logs-loki-stack.tmpl.yaml` | Optional `LokiStack/data-science-usage-logs-lokistack` |
+| `usage-logs-lokistack-network-policy.tmpl.yaml` | Local usage-log LokiStack ingress policy |
+
+MaaS owns the gateway access logger and identity capture. The collector's
+`groupbyattrs/maas` processor promotes `organization_id` and `user_id`, when
+present, from log attributes to resource attributes. Both logs pipelines run it
+before batching. The local LokiStack indexes these resource attributes for its
+`application` tenant, alongside the existing usage-log attributes and the global
+`service.name` attribute. This supports the identity matchers injected by the
+MaaS API Loki read proxy. Records missing the IDs continue through the collector.
+
+Source-cluster attributes configured under `usageLogs.attributes` are added only
+to the remote pipeline. The receiving hub owns its Loki indexing configuration;
+the local template does not configure that remote store. The independent
+`spec.logs` capability uses ClusterLogForwarder and `data-science-lokistack`.
+See [Operator-managed MaaS usage logs](usage-logs.md) for setup, identity capture,
+read endpoints, and verification.
+
 ### Alerting
 
 | Template | Resources Created |
@@ -194,7 +224,7 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
-| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. `kserve_vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
 
@@ -205,9 +235,9 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-service/blob/main/deployment/components/observability/observability/dashboards/usage-dashboard.yaml) explicitly uses the DS datasource but has no `namespace` variable. It needs a compatible namespace selection and authorization design before this change can be rolled out; the Observe dashboard companion alone does not update it.
 
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
-- **Models:** `kserve_vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **Out of scope for RHOAIENG-99814:** rewriting GPU/CPU PromQL that still references `kserve_vllm:*` inside a tenancy query (cross-stack join). That is a separate metric-ownership change.
+- **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
@@ -259,7 +289,9 @@ Each action function manages one or more conditions:
 | `ThanosQuerierAvailable` | `deployMonitoringStackWithQuerierAndRestrictions` |
 | `TempoAvailable` | `deployTracingStack` |
 | `InstrumentationAvailable` | `deployTracingStack` |
-| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` |
+| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status `Ready=True` with current `observedGeneration`) |
+| `UsageLogsLokiStackAvailable` | `deployUsageLogsLokiStack` and storage validation |
+| `UsageLogsCollectorAvailable` | `deployUsageLogsCollector` and storage validation |
 | `AlertingAvailable` | `deployAlerting` |
 | `PersesAvailable` | `deployPerses` |
 | `PersesTempoDataSourceAvailable` | `deployPersesTempoIntegration` |
