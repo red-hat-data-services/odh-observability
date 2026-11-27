@@ -38,8 +38,13 @@ make build
 ### Run Locally
 
 ```bash
-POD_NAMESPACE=opendatahub make run
+POD_NAMESPACE=opendatahub MONITORING_NAMESPACE=opendatahub make run
 ```
+
+`MONITORING_NAMESPACE` should match the namespace your `Monitoring` resource
+renders into; without it the operator falls back to unscoped cluster-wide
+caches, which can use excessive memory and cannot read opted-out unlabeled
+resources (see [Environment Variables](#environment-variables)).
 
 ### Deploy to a Cluster
 
@@ -95,6 +100,14 @@ spec:
 | `collectorReplicas` | OTel Collector replica count (requires metrics or traces) |
 
 ## Development
+
+### Trace query skill
+
+The read-only [`observability-traces-query`](skills/observability-traces-query/SKILL.md)
+skill queries bounded RHOAI Tempo searches and trace IDs through the validated
+endpoints returned by `observability-endpoint-discovery`. Its documentation
+covers the required inventory, caller token, service CA, query, and result
+validation steps.
 
 ### Testing
 
@@ -176,7 +189,7 @@ tests/e2e/                      End-to-end test suite
 - **Condition aggregation** — per-feature conditions are aggregated into top-level Ready/Degraded status
 - **TLS-only collector scraping** — the OTel Collector's internal telemetry is re-exported through a TLS-enabled pipeline exporter on `:8890` (service `data-science-collector-monitoring`, cert via OpenShift service-CA) because the Go SDK Prometheus pull exporter does not support TLS natively. Prometheus scrapes this endpoint over HTTPS.
 - **TLS-protected OTLP receivers** — both the main collector and the optional Usage Logs collector serve OTLP gRPC (`:4317`) and HTTP (`:4318`) with OpenShift service-CA certificates. In-cluster clients should use each collector's generated headless Service DNS name over HTTPS/gRPC TLS and trust `/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`.
-- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows the Prometheus pod selector to scrape the active TLS endpoints on `:8889`/`:8890`; the operator-created `:8888` Service is not an active pod-IP listener and is not admitted. OTLP `:4317`/`:4318` uses TLS with an OpenShift service-CA certificate and requires an administrator-enrolled namespace plus the KServe inference or scheduler pod labels. The TargetAllocator has a separate policy allowing only collector pods on `:8080` and discovered Kubernetes API endpoint egress.
+- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows the Prometheus pod selector to scrape the active TLS endpoints on `:8889`/`:8890`/`:8891`; the operator-created `:8888` Service is not an active pod-IP listener and is not admitted. OTLP `:4317`/`:4318` uses TLS with an OpenShift service-CA certificate and requires an administrator-enrolled namespace plus the KServe inference or scheduler pod labels. The TargetAllocator has a separate policy allowing only collector pods on `:8080` and discovered Kubernetes API endpoint egress.
 
 ### Enrolling inference namespaces for OTLP
 
@@ -215,6 +228,7 @@ scraping and ClusterLogForwarder-to-Loki delivery do not require this label.
 | Variable | Description |
 |----------|-------------|
 | `POD_NAMESPACE` | Operator's own namespace (required for local run) |
+| `MONITORING_NAMESPACE` | Namespace the operator renders Monitoring resources into. Required in supported deployments (set by the Helm chart). When unset (standalone/local dev only), Secret and NetworkPolicy caches stay unfiltered cluster-wide and other caches fall back to cluster-wide label selectors — opted-out unlabeled singletons (`opendatahub.io/managed: "false"` without the `part-of` label) then become unreadable from the Deployment, Service, and Route caches |
 | `GATEWAY_NAMESPACE` | Optional namespace containing the router or gateway that reaches monitoring proxy routes |
 | `OPERATOR_VERSION` | Stamped into release status |
 | `RELATED_IMAGE_*` | Container image overrides for managed components |

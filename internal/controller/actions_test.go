@@ -355,8 +355,8 @@ func TestDeployTracingStack_PVBackend_CRDsPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 3 {
-		t.Errorf("expected 3 sources (TempoMonolithic + NetworkPolicy + Instrumentation), got %d", len(sources))
+	if len(sources) != 4 {
+		t.Errorf("expected 4 sources (TempoMonolithic + NetworkPolicy + Route + Instrumentation), got %d", len(sources))
 	}
 
 	tempoC := findCondition(m, conditions.ConditionTempoAvailable)
@@ -383,8 +383,8 @@ func TestDeployTracingStack_S3Backend_CRDsPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (TempoStack + Instrumentation), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (TempoStack + Route + Instrumentation), got %d", len(sources))
 	}
 }
 
@@ -428,9 +428,9 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 7 sources with the always-on OTel templates included in the metrics path
-	if len(sources) != 7 {
-		t.Errorf("expected 7 sources for metrics+OTel, got %d", len(sources))
+	// 8 sources with the ordinal-0 resource scrape service included in the metrics path
+	if len(sources) != 8 {
+		t.Errorf("expected 8 sources for metrics+OTel, got %d", len(sources))
 	}
 
 	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
@@ -583,7 +583,7 @@ func TestDeployOpenTelemetryCollector_ExportersOnlyMetrics_NoServiceMonitors(t *
 		t.Errorf("expected 5 sources for exporters-only metrics, got %d", len(sources))
 	}
 	for _, source := range sources {
-		if source.Path == CollectorServiceMonitorsTemplate || source.Path == CollectorPrometheusServiceTemplate {
+		if source.Path == CollectorServiceMonitorsTemplate || source.Path == CollectorPrometheusServiceTemplate || source.Path == CollectorResourcePrometheusServiceTemplate {
 			t.Errorf("exporters-only metrics must not include %s", source.Path)
 		}
 	}
@@ -616,9 +616,9 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base + ServiceMonitors + prometheus service + 2 traces RBAC (MLflow + Tempo)
-	if len(sources) != 9 {
-		t.Errorf("expected 9 sources for metrics+traces+OTel, got %d", len(sources))
+	// 5 base + ServiceMonitors + prometheus services + 2 traces RBAC (MLflow + Tempo)
+	if len(sources) != 10 {
+		t.Errorf("expected 10 sources for metrics+traces+OTel, got %d", len(sources))
 	}
 
 	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
@@ -864,6 +864,28 @@ func TestDeployWebhookInfrastructure_TLSSecretMissing(t *testing.T) {
 
 	if len(sources) != 0 {
 		t.Errorf("expected 0 sources (chart deploys webhook resources), got %d", len(sources))
+	}
+
+	wc := findCondition(m, conditions.ConditionWebhookAvailable)
+	if wc == nil || wc.Status != metav1.ConditionFalse || wc.Reason != "TLSSecretPending" {
+		t.Errorf("WebhookAvailable: expected False/TLSSecretPending, got %v", wc)
+	}
+}
+
+func TestDeployWebhookInfrastructure_MissingPodNamespace(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	t.Setenv("OPERATOR_NAME", "odh-observability")
+	t.Setenv("POD_NAMESPACE", "")
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployWebhookInfrastructure(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error when POD_NAMESPACE is empty: %v", err)
 	}
 
 	wc := findCondition(m, conditions.ConditionWebhookAvailable)
@@ -4063,6 +4085,58 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	}
 }
 
+func TestDeployKorrel8r_OptedOutUnlabeledResourcesMarkAvailable(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	replicas := int32(1)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        Korrel8rServiceName,
+				Namespace:   m.Spec.Namespace,
+				Annotations: map[string]string{"opendatahub.io/managed": "false"},
+			},
+			Spec:   appsv1.DeploymentSpec{Replicas: &replicas},
+			Status: appsv1.DeploymentStatus{ReadyReplicas: replicas},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        Korrel8rServiceName,
+				Namespace:   m.Spec.Namespace,
+				Annotations: map[string]string{"opendatahub.io/managed": "false"},
+			},
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      Korrel8rServiceName + "-abcde",
+				Namespace: m.Spec.Namespace,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: func() *bool { value := true; return &value }(),
+				},
+			}},
+		},
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("Korrel8rAvailable: want True, got %v", condition)
+	}
+}
+
 func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
@@ -4316,7 +4390,32 @@ func usageLogsCredentialSecret() *corev1.Secret {
 			Name:      "hub-usage-logs-auth",
 			Namespace: "test-ns",
 		},
-		Data: map[string][]byte{"token": []byte("not-a-real-token")},
+		Data: map[string][]byte{
+			"token":  []byte("not-a-real-token"),
+			"ca.crt": []byte("not-a-real-ca"),
+		},
+	}
+}
+
+func assertUsageLogsCredentialItems(t *testing.T, credentialVolume map[string]any) {
+	t.Helper()
+
+	items, found, err := unstructured.NestedSlice(credentialVolume, "secret", "items")
+	if err != nil || !found {
+		t.Fatalf("credential Secret projection missing: %v", err)
+	}
+	projected := make(map[string]string, len(items))
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			t.Fatalf("invalid credential Secret item: %v", rawItem)
+		}
+		key, _ := item["key"].(string)
+		path, _ := item["path"].(string)
+		projected[key] = path
+	}
+	if want := map[string]string{"token": "token", "ca.crt": "ca.crt"}; !maps.Equal(projected, want) {
+		t.Errorf("credential Secret projection: want %v, got %v", want, projected)
 	}
 }
 
@@ -4484,10 +4583,14 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 	if name, _, _ := unstructured.NestedString(credentialVolume, "secret", "secretName"); name != "hub-usage-logs-auth" {
 		t.Errorf("volume does not reference the credential Secret: %v", credentialVolume)
 	}
+	assertUsageLogsCredentialItems(t, credentialVolume)
 	// The authenticator is attached by the controller, not written by the user:
 	// exporter configs are validated against an allowlist that excludes auth.
 	if a, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "auth", "authenticator"); a != "bearertokenauth/remote" {
 		t.Errorf("controller did not attach the authenticator to the exporter, got %q", a)
+	}
+	if caFile, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "tls", "ca_file"); caFile != "/var/run/secrets/usage-logs-remote/ca.crt" {
+		t.Errorf("remote exporter does not trust the mounted hub CA: %q", caFile)
 	}
 
 	// The local write must keep using the collector's own ServiceAccount token.
